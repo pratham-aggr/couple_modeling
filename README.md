@@ -1,95 +1,123 @@
 # Coupled Ocean–Atmosphere Emulator
 
-Trains a UNet to replace the atmosphere in CESM coupled simulations by predicting surface fluxes directly from ocean state, bypassing the CPL7 bulk formula.
+A UNet that predicts atmosphere-to-ocean surface fluxes directly from ocean state, bypassing the CPL7 bulk formula. Trained on 35 years of CESM2 output at 6-hourly resolution.
 
 ## Task
 
 | | |
 |---|---|
-| **Inputs** | SST, ICEFRAC, SOLIN (daily mean, t) |
-| **Outputs** | TAUX, TAUY, SHFLX, LHFLX, QFLX (daily mean, t+1) |
-| **Data** | 35 years CESM zarr, 12,740 daily samples |
-| **Cache** | `/glade/work/praggarwal/couple_cache/` (25.4 GB) |
+| **Inputs** | SST, ICEFRAC, SOLIN at time *t* (+ optional CO2, + optional 24h-prior state) |
+| **Outputs** | TAUX, TAUY, SHFLX, LHFLX, QFLX at time *t* |
+| **Data** | 35 years CESM zarr, ~200k 6-hourly samples |
+| **Architecture** | 5-level UNet, circular longitude padding, masked MSE loss |
+| **Hardware** | A100 GPU (`nvgpu` queue), account `ucsd0044` |
 
 ## Repository Layout
 
 ```
-train_unet.py           Main training script (UNet emulator)
-train_fake_atm.py       MLP fake atmosphere (radiation + TS + U10)
-preprocess_data.py      Build numpy cache from zarr (run once, ~35 min)
-compute_normalizer.py   Compute channel-wise mean/std for cache
-add_co2_to_cache.py     Append co2vmr to cache as co2.npy
-plot_predictions.py     Truth/pred/diff maps for 4 random days
-plot_rmse_maps.py       Per-pixel RMSE maps over validation set
-explore_fake_atm.py     Exploratory analysis for fake atm MLP
-fake_atm_server.py      File-based MLP inference server for CESM coupling
-test_fake_atm_server.py Standalone driver to test the inference server
+train_unet.py           UNet training (all experiments)
+preprocess_data.py      Build numpy cache from zarr (run once per lag config)
+add_co2_to_cache.py     Append co2vmr scalar to cache as co2.npy
+plot_lag_results.py     All validation plots (R² summary + spatial maps + summary figs)
+env.yaml                Conda environment
 
 scripts/
-  submit_preprocess.pbs
-  submit_train_unet.pbs     60 ep + 30 ep extension
-  submit_train_co2.pbs      60 ep with CO2 channel
-  submit_train_es.pbs       Early stopping, max 500 ep  ← active
-  submit_plot_rmse.pbs
-  submit_plot_predictions.pbs
-  submit_fake_atm_server.pbs
-  setup_fake_atm_case.sh
-```
-
-## Quick Start
-
-```bash
-# 1. One-time: build cache (submit to CPU queue, ~35 min)
-qsub scripts/submit_preprocess.pbs
-
-# 2. Train (A100, ~90 min for 60 epochs)
-qsub scripts/submit_train_unet.pbs
-
-# 3. Resume / extend
-#    Edit submit_train_unet.pbs: add --resume --extra_epochs 30
-qsub scripts/submit_train_unet.pbs
-
-# 4. Early-stopping run (up to 500 epochs, patience=20)
-qsub scripts/submit_train_es.pbs
+  submit_preprocess_lag{0,12,24}.pbs    Preprocess for lag experiments
+  submit_preprocess_mem24h.pbs          Preprocess for memory experiment
+  submit_lag{0,12,24}.pbs               Training — lag experiments (no CO2)
+  submit_lag{0,12,24}_co2.pbs           Training — lag experiments (+ CO2)
+  submit_mem24h.pbs                     Training — memory, no solin_prev, no CO2
+  submit_mem24h_solin.pbs               Training — memory, + solin_prev
+  submit_mem24h_co2.pbs                 Training — memory, + CO2
+  submit_mem24h_solin_co2.pbs           Training — memory, + solin_prev + CO2
+  submit_plot_lag_results.pbs           Spatial validation maps (per experiment)
+  submit_plot_summary.pbs               Cross-experiment summary figures (Figs 1–5)
 ```
 
 ## Experiments
 
-All runs use `subsample=1.0`, `base=64`, `lr=1e-3`, daily means. Metric: R² on 10% val set, ocean/ice points only.
+All runs: `subsample=1.0`, `base=64`, AdamW `lr=1e-3 → 1e-6` (SGDR), `patience=20`, `max_epochs=500`. Metric: R² on 10% val set, ocean/ice points only. SHFLX and LHFLX converted from J m⁻² per 6h step to W m⁻².
 
-| Run | Epochs | Notes | TAUX | TAUY | SHFLX | LHFLX | QFLX |
-|-----|--------|-------|-----:|-----:|------:|------:|-----:|
-| Exp 1 | 60 | cosine LR | 0.560 | 0.373 | 0.714 | 0.782 | 0.768 |
-| Exp 2 | 90 | +30 SGDR extension **[best]** | 0.584 | 0.385 | 0.724 | 0.796 | 0.782 |
-| Exp 3 | 60 | +CO2 channel | 0.557 | 0.371 | 0.715 | 0.782 | 0.768 |
-| Exp 4 | ES | patience=20, max 500 ep | — | — | — | — | — |
+### Lag experiments (single-timestep input)
 
-**CO2 result**: broadcasting co2vmr as a 4th input channel had no measurable effect. The model ignores it — day-to-day flux variability is dominated by SST/SOLIN, not the slow CO2 trend.
+| Run | Input | TAUX | TAUY | SHFLX | LHFLX | QFLX |
+|-----|-------|-----:|-----:|------:|------:|-----:|
+| lag=0h | SST[t], ICEFRAC[t], SOLIN[t] | 0.751 | 0.670 | 0.865 | 0.902 | 0.895 |
+| lag=12h | SST[t−12h], … | 0.741 | 0.657 | 0.862 | 0.900 | 0.893 |
+| lag=24h | SST[t−24h], … | 0.723 | 0.632 | 0.858 | 0.895 | 0.890 |
+| lag=0h+CO2 | + co2vmr | 0.733 | 0.646 | 0.860 | 0.896 | 0.890 |
+| lag=12h+CO2 | + co2vmr | 0.736 | 0.652 | 0.861 | 0.899 | 0.892 |
+| lag=24h+CO2 | + co2vmr | 0.726 | 0.637 | 0.858 | 0.896 | 0.890 |
 
-W&B project: `climate-analytics-lab/couple-unet`
+### Memory experiments (current + 24h-prior input)
+
+| Run | Input | TAUX | TAUY | SHFLX | LHFLX | QFLX |
+|-----|-------|-----:|-----:|------:|------:|-----:|
+| mem24h | SST[t]+SST[t−24h], ICEFRAC[t]+ICEFRAC[t−24h], SOLIN[t] | **0.826** | **0.772** | **0.881** | **0.934** | **0.930** |
+| mem24h+solin | + SOLIN[t−24h] | 0.819 | 0.765 | 0.878 | 0.933 | 0.928 |
+| mem24h+CO2 | + co2vmr | 0.826 | 0.772 | 0.881 | 0.934 | 0.930 |
+| mem24h+solin+CO2 | + SOLIN[t−24h] + co2vmr | 0.826 | 0.772 | 0.881 | 0.934 | 0.930 |
+
+**Key findings:**
+- Memory (24h prior state) is the most impactful change — wind stress improves by +7.5/+10pp over lag=0h
+- CO2 as an input channel has no measurable effect (≤0.002 R² difference across all configs)
+- SOLIN from 24h ago is redundant — current SOLIN captures all solar forcing information
+- Performance degrades monotonically as input lag increases (using only past state)
+
+## Caches
+
+| Cache | Location | Contents |
+|-------|----------|----------|
+| `couple_cache_lag0h` | `/glade/work/praggarwal/` | X=(SST,ICEFRAC,SOLIN) at t, Y=fluxes at t |
+| `couple_cache_lag12h` | `/glade/work/praggarwal/` | X at t−12h, Y at t |
+| `couple_cache_lag24h` | `/glade/work/praggarwal/` | X at t−24h, Y at t |
+| `couple_cache_mem24h` | `/glade/work/praggarwal/` | X=(6-ch: current+24h-prior), Y at t |
+
+Each cache: `X.npy`, `Y.npy`, `mask.npy`, `co2.npy`, `meta.json`, `normalizer.npz`
+
+## Quick Start
+
+```bash
+# Activate environment
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+# 1. Preprocess (once per cache, ~35 min on CPU)
+qsub scripts/submit_preprocess_lag0.pbs
+
+# 2. Add CO2 to cache (if running CO2 experiments)
+python add_co2_to_cache.py --cache_dir /glade/work/praggarwal/couple_cache_lag0h
+
+# 3. Train
+qsub scripts/submit_lag0.pbs
+
+# 4. Plot validation maps per experiment
+qsub scripts/submit_plot_lag_results.pbs
+
+# 5. Generate cross-experiment summary figures (Figs 1–5)
+qsub scripts/submit_plot_summary.pbs
+```
 
 ## Output Directories
 
-| Directory | Contents |
-|-----------|----------|
-| `output_unet/` | Best model (Exp 2, 90 ep) |
-| `output_unet_co2/` | CO2 experiment (Exp 3) |
-| `output_unet_es/` | Early stopping run (Exp 4, in progress) |
-| `output_full/` | Fake atmosphere MLP (different task) |
+Each `output_unet_<name>/` contains:
 
-Each output directory contains: `best_model.pt`, `checkpoint.pt`, `normalizer.npz`, `model_config.json`, `r2_scores.json`, `training_summary.png`.
+| File | Contents |
+|------|----------|
+| `best_model.pt` | Weights at lowest val loss |
+| `checkpoint.pt` | Full checkpoint (model + optimizer + scheduler) |
+| `normalizer.npz` | Per-channel mean/std |
+| `model_config.json` | Architecture + input/output var names |
+| `r2_scores.json` | Per-variable R² on val set |
+| `training_summary.png` | Loss curve + R² bar chart |
 
-## Fake Atmosphere MLP (separate model)
+## Plots
 
-Predicts radiation fluxes + TS + U10 from ocean state for use as a CESM atmosphere replacement via the CAMulator file-based coupling protocol.
-
-| Variable | R² | Variable | R² |
-|----------|----|----------|----|
-| FSDS_J | 0.893 | FLUS | 0.982 |
-| FLDS_J | 0.912 | FSUTOA | 0.812 |
-| FSUS | 0.954 | FLUT | 0.705 |
-| TS | 0.979 | U10 | 0.493 |
-| PRECT | 0.146 | | |
+| Script flag | Output | Description |
+|-------------|--------|-------------|
+| `plot_lag_results.py` | `results/r2_summary.png` | R² bar chart across all experiments |
+| `plot_lag_results.py --labels <exp>` | `results/val_maps_<exp>.png` | Truth/pred/bias maps per experiment |
+| `plot_lag_results.py --summary` | `results/fig1_truth.png` … `fig5_best_overall_error.png` | 5 cross-experiment summary figures |
 
 ## Environment
 
@@ -97,5 +125,3 @@ Predicts radiation fluxes + TS + U10 from ocean state for use as a CESM atmosphe
 module load conda
 conda activate /glade/work/praggarwal/conda-envs/atm
 ```
-
-Queue: `nvgpu` (A100), account: `ucsd0044`. Only 1 concurrent GPU job allowed under this allocation.
