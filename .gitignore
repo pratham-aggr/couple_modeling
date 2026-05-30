@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Model outputs (large binary files)
+output_*/
+*.pt
+*.npz
+
+# Logs
+*.log
+*.err
+STDIN.*
+
+# Results (generated figures)
+results/
+
+# Wandb
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+*.egg
+.env

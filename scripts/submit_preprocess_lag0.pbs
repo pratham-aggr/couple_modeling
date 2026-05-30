@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -N preprocess_lag0h
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=02:00:00
+#PBS -o /glade/u/home/praggarwal/couple/preprocess_lag0h.log
+#PBS -e /glade/u/home/praggarwal/couple/preprocess_lag0h.err
+#PBS -j oe
+
+set -euo pipefail
+echo "Started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd /glade/u/home/praggarwal/couple
+
+python -u preprocess_data.py \
+    --lag       0 \
+    --cache_dir /glade/work/praggarwal/couple_cache_lag0h
+
+python -u add_co2_to_cache.py \
+    --cache_dir /glade/work/praggarwal/couple_cache_lag0h
+
+echo "Done: $(date)"

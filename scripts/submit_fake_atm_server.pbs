@@ -1,0 +1,33 @@
+#!/bin/bash
+#PBS -N fake_atm_server
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=4:ngpus=1:mem=32GB
+#PBS -l walltime=02:00:00
+#PBS -o /glade/u/home/praggarwal/couple/fake_atm_server.log
+#PBS -e /glade/u/home/praggarwal/couple/fake_atm_server.err
+#PBS -j oe
+
+# CESM run directory — must match RUNDIR in setup_fake_atm_case.sh
+RUNDIR=/glade/derecho/scratch/praggarwal/g.e21.FAKE_ATM_GIAF_v01/run
+
+# Couple dir (where model and normalizer live)
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+
+set -euo pipefail
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+# Copy model files to run directory if not already there
+cp -n ${COUPLE_DIR}/fake_atm_server.py  ${RUNDIR}/
+cp -rn ${COUPLE_DIR}/output_full/       ${RUNDIR}/output_full/
+cp -n ${COUPLE_DIR}/train_fake_atm.py   ${RUNDIR}/
+cp -n ${COUPLE_DIR}/explore_fake_atm.py ${RUNDIR}/
+
+cd ${RUNDIR}
+
+echo "Starting fake_atm_server at $(date)"
+python -u fake_atm_server.py \
+    --run_dir   ${RUNDIR} \
+    --model_dir ${RUNDIR}/output_full

@@ -1,0 +1,36 @@
+#!/bin/bash
+#PBS -N unet_lag24h_co2
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/unet_lag24h_co2.log
+#PBS -e /glade/u/home/praggarwal/couple/unet_lag24h_co2.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID" \
+    >> /glade/u/home/praggarwal/couple/unet_lag24h_co2.log
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "Starting lag=24h +CO2 UNet training at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output_unet_lag24h_co2 \
+    --subsample     1.0 \
+    --lag           24 \
+    --sixhour \
+    --with_co2 \
+    --max_epochs    500 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --wandb_project couple-unet
+echo "Done at $(date)"

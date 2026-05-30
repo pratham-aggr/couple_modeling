@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -N preprocess_mem24h
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=04:00:00
+#PBS -o /glade/u/home/praggarwal/couple/preprocess_mem24h.log
+#PBS -e /glade/u/home/praggarwal/couple/preprocess_mem24h.err
+#PBS -j oe
+
+set -euo pipefail
+echo "Started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd /glade/u/home/praggarwal/couple
+find . -path ./__pycache__ -prune -o -name "*.pyc" -print -exec rm {} \;
+
+echo "=== Preprocessing memory cache ==="
+python -u preprocess_data.py --memory
+
+echo "=== Adding CO2 to memory cache ==="
+python -u add_co2_to_cache.py \
+    --cache_dir /glade/work/praggarwal/couple_cache_mem24h
+
+echo "Done: $(date)"

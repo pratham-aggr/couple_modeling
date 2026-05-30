@@ -1,0 +1,22 @@
+#!/bin/bash
+#PBS -N plot_lag_results
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -l walltime=04:00:00
+#PBS -o /glade/u/home/praggarwal/couple/plot_lag_results.log
+#PBS -e /glade/u/home/praggarwal/couple/plot_lag_results.err
+#PBS -j oe
+
+set -euo pipefail
+echo "Started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd /glade/u/home/praggarwal/couple
+
+python -u plot_lag_results.py \
+    --skip_r2 \
+    --labels "lag=0h+CO2" "lag=12h+CO2" "lag=24h+CO2"
+echo "Done: $(date)"
