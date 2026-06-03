@@ -1,0 +1,36 @@
+#!/bin/bash
+#PBS -N unet_mem24h_lw_vw
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/unet_mem24h_lw_vw.log
+#PBS -e /glade/u/home/praggarwal/couple/unet_mem24h_lw_vw.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "Starting mem24h + lat_weight + loss_weights 2 3 1 1 1 at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_lw_vw \
+    --subsample     1.0 \
+    --memory \
+    --max_epochs    500 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --lat_weight \
+    --loss_weights  2 3 1 1 1 \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"

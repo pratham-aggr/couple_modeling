@@ -1,0 +1,8 @@
+1980 - 2009  (30 years, 86%)  →  train
+2010 - 2012  (3 years,   9%)  →  val (early stopping)
+2013 - 2014  (2 years,   6%)  →  test (reported once)
+
+
+Training:    1980 – 2010  (31 years)
+Validation:  2011 – 2012  (2 years)
+Testing:     2013 – 2014  (2 years)

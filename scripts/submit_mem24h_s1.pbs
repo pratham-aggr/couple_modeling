@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N unet_mem24h_s1
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/unet_mem24h_s1.log
+#PBS -e /glade/u/home/praggarwal/couple/unet_mem24h_s1.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Canonical temporal split:
+#   train  1980-2009  (30 years, 86%)
+#   val    2010-2012  ( 3 years,  9%)
+#   test   2013-2014  ( 2 years,  6%)
+echo "Starting mem24h with canonical train/val/test split at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_s1 \
+    --subsample     1.0 \
+    --memory \
+    --max_epochs    500 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --scheduler     cosine \
+    --val_years     2010 2012 \
+    --test_years    2013 2014 \
+    --wandb_name    mem24h-s1 \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"
