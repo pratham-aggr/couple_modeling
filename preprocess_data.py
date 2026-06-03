@@ -139,18 +139,21 @@ def main():
     parser.add_argument("--sixhour", action="store_true",
                         help="Force 6-hourly resolution even for --lag 24.")
     parser.add_argument("--memory", action="store_true",
-                        help="Memory experiment: X = [state_t, state_{t-24h}] → Y = fluxes_t. "
+                        help="Memory experiment: X = [state_t, state_{t-Nh}] → Y = fluxes_t. "
                              "Stores all 6 channels; training selects subset via --prev_solin.")
+    parser.add_argument("--memory_lag", type=int, default=24,
+                        help="Memory lag in hours (default 24). Only used with --memory.")
     args = parser.parse_args()
 
     memory    = args.memory
     daily     = (not args.sixhour and args.lag == 24) if not memory else False
     lag_steps = (args.lag // 6 if not daily else 1)   if not memory else 0
+    mem_lag_steps = args.memory_lag // 6  # convert hours to 6h steps
 
     if args.cache_dir:
         cache_dir = Path(args.cache_dir)
     elif memory:
-        cache_dir = Path("/glade/work/praggarwal/couple_cache_mem24h")
+        cache_dir = Path(f"/glade/work/praggarwal/couple_cache_mem{args.memory_lag}h")
     elif daily:
         cache_dir = Path("/glade/work/praggarwal/couple_cache")
     else:
@@ -188,7 +191,7 @@ def main():
         T  = len(ds["time"])
         ds.close()
         if memory:
-            n_pairs = T - MEMORY_LAG_STEPS
+            n_pairs = T - mem_lag_steps
         else:
             n_steps = T // 4 if daily else T
             n_pairs = n_steps - lag_steps if lag_steps > 0 else n_steps
@@ -211,7 +214,7 @@ def main():
     offset = 0
     for i, (zp, n) in enumerate(zip(zarr_paths, counts)):
         if memory:
-            X, Y, mask = load_year_full_memory(zp, tgt_vars, MEMORY_LAG_STEPS)
+            X, Y, mask = load_year_full_memory(zp, tgt_vars, mem_lag_steps)
         else:
             X, Y, mask = load_year_full(zp, tgt_vars, daily, lag_steps)
         X_mm   [offset:offset+n] = X
@@ -262,7 +265,7 @@ def main():
         "lag_steps":        lag_steps,
         "daily":            daily,
         "memory":           memory,
-        "memory_lag_steps": MEMORY_LAG_STEPS if memory else 0,
+        "memory_lag_steps": mem_lag_steps if memory else 0,
         "H": H, "W": W,
         "zarr_glob":        ZARR_GLOB,
     }, open(cache_dir / "meta.json", "w"), indent=2)
