@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEMO — Ocean→Flux Emulator (interactive demo)</title>
+<style>
+  :root {
+    --bg:#0f1419; --panel:#1a212b; --ink:#e6edf3; --muted:#9aa7b4;
+    --accent:#4c72b0; --line:#2a3340;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--ink); line-height:1.45;
+  }
+  header {
+    padding:20px 28px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;
+  }
+  header h1 { font-size:20px; margin:0; font-weight:650; letter-spacing:.2px; }
+  header .sub { color:var(--muted); font-size:13px; margin-top:3px; }
+  header a {
+    color:var(--ink); text-decoration:none; border:1px solid var(--line);
+    padding:6px 12px; border-radius:7px; font-size:13px; margin-left:8px;
+  }
+  header a:hover { border-color:var(--accent); }
+  .wrap { max-width:1180px; margin:0 auto; padding:22px 28px 60px; }
+  .controls {
+    display:flex; gap:22px; flex-wrap:wrap; align-items:flex-end;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:16px 18px; margin-bottom:20px;
+  }
+  .ctl label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.7px; color:var(--muted); margin-bottom:6px; }
+  select, button {
+    background:#0d1117; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:8px 12px; font-size:14px; cursor:pointer;
+  }
+  select:focus, button:focus { outline:1px solid var(--accent); }
+  .date-row { display:flex; align-items:center; gap:8px; }
+  .models { display:flex; gap:8px; flex-wrap:wrap; }
+  .pill {
+    display:flex; align-items:center; gap:7px; padding:8px 13px; border-radius:20px;
+    border:1px solid var(--line); cursor:pointer; font-size:13.5px; user-select:none;
+  }
+  .pill .dot { width:11px; height:11px; border-radius:50%; }
+  .pill.active { border-color:var(--ink); background:#0d1117; font-weight:600; }
+  figure { margin:0; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  figure img { width:100%; display:block; border-radius:6px; background:#fff; }
+  figcaption { color:var(--muted); font-size:13px; margin-top:10px; }
+  .scores { margin-top:24px; }
+  .scores h3 { font-size:14px; margin:0 0 10px; font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; }
+  th, td { text-align:right; padding:8px 12px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  thead th { color:var(--muted); font-weight:600; }
+  td.best { color:#7fd18a; font-weight:600; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:7px; vertical-align:middle; }
+  .note { color:var(--muted); font-size:12.5px; margin-top:18px; }
+  .note code { background:#0d1117; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>MEMO — Memory-Enhanced Marine Flux Output</h1>
+    <div class="sub">A U-Net that predicts ocean→atmosphere surface fluxes from ocean state. Evaluated on fully held-out years 2013–2014 (temporal split).</div>
+  </div>
+  <nav>
+    <a id="repo" href="#" target="_blank" rel="noopener">GitHub</a>
+    <a id="paper" href="#" target="_blank" rel="noopener">Paper</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div class="controls">
+    <div class="ctl">
+      <label>Date (held-out test set)</label>
+      <div class="date-row">
+        <button id="prev">◀</button>
+        <select id="date"></select>
+        <button id="next">▶</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <label>Flux variable</label>
+      <select id="flux"></select>
+    </div>
+    <div class="ctl" style="flex:1; min-width:280px;">
+      <label>Model</label>
+      <div class="models" id="models"></div>
+    </div>
+  </div>
+
+  <figure>
+    <img id="view" alt="prediction maps">
+    <figcaption id="cap"></figcaption>
+  </figure>
+
+  <div class="scores">
+    <h3>Pooled test-set R² (2013–2014, ocean &amp; sea-ice points)</h3>
+    <table id="scores"></table>
+    <div class="note">
+      The four panels are: <b>SST input</b> · <b>model prediction</b> · <b>CESM “truth”</b> · <b>error</b>.
+      All three models are driven from the identical timestep. The headline R² above is pooled over the
+      whole test set; the value in each image title is for that single map.
+      Memory (24&nbsp;h of ocean-state history) is the dominant driver of skill, especially for the wind
+      stresses <code>TAUX</code>/<code>TAUY</code>.
+    </div>
+  </div>
+</div>
+
+<script>
+const REPO_URL  = "https://github.com/pratham-aggr/couple_modeling";
+const PAPER_URL = "#";
+
+let M = null, state = { k:0, flux:"TAUX", model:"drop" };
+
+function el(id){ return document.getElementById(id); }
+
+function render(){
+  const img = `assets/${state.model}__${state.flux}__${state.k}.jpg`;
+  el("view").src = img;
+  const md = M.models.find(m=>m.key===state.model);
+  const d  = M.picks[state.k].date;
+  el("cap").textContent = `${md.label} · ${state.flux} · ${d} UTC`;
+  document.querySelectorAll(".pill").forEach(p=>{
+    p.classList.toggle("active", p.dataset.key===state.model);
+  });
+}
+
+function buildScores(){
+  const t = el("scores");
+  let h = "<thead><tr><th>Model</th>";
+  M.fluxes.forEach(f=> h += `<th>${f}</th>`);
+  h += "</tr></thead><tbody>";
+  // find best per flux
+  const best = {};
+  M.fluxes.forEach(f=>{
+    best[f] = Math.max(...M.models.map(m=> m.scores[f] ?? -Infinity));
+  });
+  M.models.forEach(m=>{
+    h += `<tr><td><span class="swatch" style="background:${m.color}"></span>${m.label}</td>`;
+    M.fluxes.forEach(f=>{
+      const v = m.scores[f];
+      const cls = (v!=null && Math.abs(v-best[f])<1e-9) ? "best" : "";
+      h += `<td class="${cls}">${v!=null ? v.toFixed(3) : "—"}</td>`;
+    });
+    h += "</tr>";
+  });
+  t.innerHTML = h + "</tbody>";
+}
+
+fetch("manifest.json").then(r=>r.json()).then(m=>{
+  M = m;
+  el("repo").href = REPO_URL;
+  el("paper").href = PAPER_URL;
+
+  // dates
+  const dsel = el("date");
+  m.picks.forEach(p=> dsel.add(new Option(p.date, p.k)));
+  dsel.onchange = ()=>{ state.k = +dsel.value; render(); };
+  el("prev").onclick = ()=>{ state.k=(state.k-1+m.picks.length)%m.picks.length; dsel.value=state.k; render(); };
+  el("next").onclick = ()=>{ state.k=(state.k+1)%m.picks.length; dsel.value=state.k; render(); };
+
+  // flux
+  const fsel = el("flux");
+  m.fluxes.forEach(f=> fsel.add(new Option(f, f)));
+  fsel.value = state.flux;
+  fsel.onchange = ()=>{ state.flux = fsel.value; render(); };
+
+  // models
+  const mc = el("models");
+  m.models.forEach(md=>{
+    const p = document.createElement("div");
+    p.className = "pill"; p.dataset.key = md.key;
+    p.innerHTML = `<span class="dot" style="background:${md.color}"></span>${md.label}`;
+    p.onclick = ()=>{ state.model = md.key; render(); };
+    mc.appendChild(p);
+  });
+
+  buildScores();
+  render();
+});
+</script>
+</body>
+</html>

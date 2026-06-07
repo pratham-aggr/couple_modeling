@@ -1,0 +1,38 @@
+name: Deploy MEMO demo to GitHub Pages
+
+# Publishes the static demo in ./demo as the GitHub Pages site.
+# No build step: the demo is plain HTML + JSON + JPEGs committed to the repo.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "demo/**"
+      - ".github/workflows/deploy-demo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Upload demo folder
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./demo
+      - id: deployment
+        uses: actions/deploy-pages@v4
