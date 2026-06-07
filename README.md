@@ -1,4 +1,5 @@
 # Coupled Ocean–Atmosphere Emulator
+[DEMO LINK](https://pratham-aggr.github.io/couple_modeling)
 
 A UNet that predicts atmosphere-to-ocean surface fluxes directly from ocean state, bypassing the CPL7 bulk formula. Trained on 35 years of CESM2 output at 6-hourly resolution.
 
