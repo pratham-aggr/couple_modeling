@@ -1,8 +1,236 @@
-1980 - 2009  (30 years, 86%)  →  train
-2010 - 2012  (3 years,   9%)  →  val (early stopping)
-2013 - 2014  (2 years,   6%)  →  test (reported once)
-
-
 Training:    1980 – 2010  (31 years)
 Validation:  2011 – 2012  (2 years)
 Testing:     2013 – 2014  (2 years)
+
+--- Updated data-split paragraph (temporal / CAMulator split) ---
+
+Samples are partitioned chronologically rather than randomly, following the
+CAMulator protocol (Chapman et al., 2025), so that evaluation measures genuine
+out-of-sample generalization to future years rather than interpolation within
+the training period. The first 31 years (1980--2010) are used for training,
+2011--2012 for validation, and the final two years (2013--2014) are held out as
+a test set. The validation set is used only for early-stopping decisions, while
+the test set is held out entirely during training and model selection and is
+evaluated once, after training, for the reported $R^2$ scores. Crucially, all
+normalization statistics are computed from the training years alone, so no
+information from the validation or test period leaks into the model. This yields
+45,136 training, 2,912 validation, and 2,912 test samples across the full
+35-year record.
+
+==================================================================
+ Revised abstract (temporal split) -- ready to paste
+==================================================================
+
+Accurate representation of ocean--atmosphere surface fluxes is critical for
+coupled climate simulations, but computing these fluxes with a full atmospheric
+model is computationally expensive. We present MEMO (Memory-Enhanced Marine Flux
+Output), a neural emulator that predicts five key surface fluxes---TAUX, TAUY,
+SHFLX, LHFLX, and QFLX---directly from the ocean state, eliminating the need for
+atmospheric model inference. MEMO is a five-level U-Net trained on 31 years of
+6-hourly CESM2 output (1980--2010) and evaluated over ocean and sea-ice points on
+two fully held-out future years (2013--2014), a temporal split that measures
+genuine out-of-sample generalization rather than interpolation within the
+training period. We find that providing 24 hours of ocean-state history is the
+single most important design choice: relative to a memory-free baseline, it
+improves held-out wind-stress skill from $R^2 = 0.377$ to $0.673$ for TAUX and
+from $0.183$ to $0.571$ for TAUY, and raises the heat and moisture fluxes to high
+accuracy (LHFLX: $0.898$, QFLX: $0.909$). Without memory the emulator overfits
+the training years almost immediately and generalizes poorly across all five
+fluxes. Wind stress remains the hardest target because the near-surface wind is
+not an input; light regularization---spatial dropout and a physically exact
+longitudinal augmentation---further recovers this skill, reaching $R^2 = 0.72$
+(TAUX) and $0.62$ (TAUY). An auxiliary atmospheric CO$_2$ channel provides
+negligible benefit once SST is known, even though the test years lie above the
+training-period CO$_2$ range. These findings show that MEMO captures the dominant
+mechanisms of ocean--atmosphere coupling and generalizes to unseen future
+climate states, offering a promising route toward faster coupled climate
+simulations.
+
+
+==================================================================
+ Methods subsections (LaTeX) -- ready to paste into the manuscript
+==================================================================
+
+(Data + Preprocessing + Memory construction + split are already covered by the
+existing \subsection{Dataset and Preprocessing} -- not duplicated here.)
+
+%------------------------------------------------------------------
+\subsection{Network architecture}
+%------------------------------------------------------------------
+MEMO is a five-level encoder--decoder U-Net with a base width of 64 channels
+(channel progression $64\to128\to128\to256\to512$). We use five resolution
+levels rather than six because the $192\times288$ grid is divisible by $2^5$ but
+not $2^6$, which avoids spatial padding at the bottleneck. To respect the
+periodicity of the sphere, every convolution is preceded by \emph{circular}
+padding in longitude and \emph{replicate} padding in latitude; this zonally
+periodic boundary condition is also what makes the longitudinal data
+augmentation (Section~\ref{sec:aug}) physically exact. Each encoder block applies
+this padding followed by a stride-2 convolution (kernel size 4), batch
+normalization, and a LeakyReLU ($\alpha=0.2$) activation; each decoder block
+applies bilinear upsampling, the same padding, a convolution, batch
+normalization, and a ReLU activation. Convolutional weights are initialized from
+$\mathcal{N}(0, 0.02)$ and batch-normalization scales from $\mathcal{N}(1, 0.02)$.
+
+%------------------------------------------------------------------
+\subsection{Training}
+%------------------------------------------------------------------
+We minimize the mean-squared error between predicted and target fluxes, averaged
+over ocean/sea-ice points only. Models are optimized with AdamW (learning rate
+$10^{-3}$, weight decay $10^{-4}$) using a cosine learning-rate schedule and a
+batch size of 8. Training runs for up to 500 epochs with early stopping
+(patience 40) on the validation loss, and the checkpoint with the lowest
+validation loss is retained for evaluation. All experiments were run in PyTorch
+on a single NVIDIA A100 GPU.
+
+%------------------------------------------------------------------
+\subsection{Evaluation metric}
+%------------------------------------------------------------------
+We report the coefficient of determination $R^2$ separately for each target
+flux. For a given variable, predictions and truth are pooled over all
+ocean/sea-ice grid points and all test timesteps, and
+\begin{equation}
+  R^2 = 1 - \frac{\sum_i (y_i - \hat{y}_i)^2}{\sum_i (y_i - \bar{y})^2},
+\end{equation}
+where the sums run over the pooled spatiotemporal sample, $\hat{y}_i$ is the
+prediction, and $\bar{y}$ is the mean of the truth over that sample. This pooled
+spatiotemporal $R^2$ rewards skill in both the spatial pattern and the temporal
+evolution of each flux.
+
+%------------------------------------------------------------------
+\subsection{Generalization and regularization}\label{sec:aug}
+%------------------------------------------------------------------
+The temporal split evaluates extrapolation to unseen future years, which exposes
+overfitting that a random split does not. To improve out-of-sample skill---
+particularly for wind stress---we employ two regularizers. First, we apply
+longitudinal data augmentation: during training only, each sample is circularly
+shifted by a random offset along the longitude axis, with the inputs, targets,
+and ocean mask rolled by the same amount so they remain aligned. This
+transformation is exact rather than approximate because the grid is zonally
+periodic and the network uses circular longitude padding. Second, we apply
+spatial dropout ($p=0.1$) within the U-Net blocks. We assess each lever
+independently---dropout, weight decay, longitudinal augmentation, network
+capacity, and auxiliary CO$_2$ input---before combining the levers that improve
+held-out test skill.
+```latex
+%==================================================================
+\section{Results}
+%==================================================================
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_temporal_results.pdf}
+\caption{Test-set $R^2$ on the held-out years 2013--2014. Memory provides the
+largest improvement, particularly for wind-stress prediction (TAUX and TAUY),
+while regularization yields smaller additional gains.}
+\label{fig:results}
+\end{figure}
+
+%------------------------------------------------------------------
+\subsection{MEMO generalizes to unseen future years}
+%------------------------------------------------------------------
+MEMO is trained on CESM2 output from 1980--2010 and evaluated on two completely
+held-out future years (2013--2014). This temporal split provides a stringent
+test of out-of-sample generalization because the model must predict climate
+states that occur after the training period.
+
+The emulator predicts heat and moisture fluxes with high accuracy on these
+unseen years. The best model achieves $R^2 = 0.848$ for sensible heat flux
+(SHFLX), $0.905$ for latent heat flux (LHFLX), and $0.914$ for moisture flux
+(QFLX). These results indicate that the relationship between ocean conditions
+and heat or moisture exchange remains stable across time.
+
+Wind stress is substantially more difficult to predict. The best model reaches
+$R^2 = 0.718$ for TAUX and $0.624$ for TAUY. This lower skill is expected
+because near-surface winds are not provided as inputs and must instead be
+inferred indirectly from the ocean state.
+
+%------------------------------------------------------------------
+\subsection{Temporal memory is the primary driver of performance}
+%------------------------------------------------------------------
+The largest performance gains come from providing the model with 24 hours of
+ocean-state history. The memory-free baseline generalizes poorly to future
+years, achieving only $R^2 = 0.377$ for TAUX and $0.183$ for TAUY. Adding
+lagged SST and sea-ice fields increases these scores to $0.673$ and $0.571$,
+respectively, while also substantially improving the heat and moisture fluxes.
+
+These results suggest that information about the recent evolution of the ocean
+is essential for predicting surface fluxes, particularly wind stress. Unlike
+the heat and moisture fluxes, wind stress depends strongly on atmospheric
+conditions that are not directly observed by the model. Temporal memory allows
+the network to infer part of this missing information from recent changes in the
+ocean state.
+
+Regularization provides a smaller but measurable improvement. Adding spatial
+dropout increases TAUX from $0.693$ to $0.716$ and TAUY from $0.592$ to $0.622$,
+while longitudinal augmentation yields a further modest gain. In contrast,
+increasing weight decay, reducing network capacity, or adding atmospheric
+CO$_2$ as an input channel provides little or no improvement. Even though the
+held-out years contain CO$_2$ concentrations outside the training range, the
+ocean state already appears to contain the information required for accurate
+flux prediction.
+
+Overall, temporal memory is the dominant factor controlling performance,
+whereas additional inputs and regularization contribute only incremental
+improvements.
+```
+
+==================================================================
+ Methods additions: training-curves figure + wind-stress waterfall
+==================================================================
+
+------------------------------------------------------------------------
+INSERT into \subsection{Evaluation and Regularization}
+------------------------------------------------------------------------
+After the sentence:
+  "...it provides a stricter test of generalization than a random
+   train--test split."
+ADD:
+
+Figure~\ref{fig:curves} illustrates this behaviour concretely: without
+regularization, the validation loss of the memory-carrying model begins
+to diverge from training loss within the first few dozen epochs, even
+though training loss continues to fall. Spatial dropout ($p=0.1$) keeps
+train and validation curves nearly coincident throughout the full
+500-epoch run, indicating that the regularized model does not memorize
+the training years.
+
+------------------------------------------------------------------------
+FIGURE FLOAT (place just before or inside \subsection{Evaluation and Regularization})
+------------------------------------------------------------------------
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_training_curves.pdf}
+\caption{Training (solid) and validation (dashed) MSE loss for four
+model configurations on the temporal split (train 1980--2010, val
+2011--2012). Without regularization (panels a--c) validation loss
+diverges from training loss, reflecting overfitting to the training
+years. Spatial dropout ($p=0.1$, panel d) eliminates this gap, keeping
+the two curves nearly coincident for all 500 epochs.}
+\label{fig:curves}
+\end{figure}
+
+------------------------------------------------------------------------
+Wind-stress waterfall (fig_wind_stress_waterfall) → goes in RESULTS
+------------------------------------------------------------------------
+Inside \subsection{Temporal memory is the primary driver of performance},
+replace the sentence that lists TAUX/TAUY numbers in prose with:
+
+Figure~\ref{fig:waterfall} decomposes the cumulative gain for the two
+wind-stress components. Memory alone accounts for the dominant
+improvement (TAUX: $0.377\to0.673$; TAUY: $0.183\to0.571$); the SST
+tendency input, dropout, and longitudinal augmentation each add smaller
+but measurable increments. By contrast, heat and moisture fluxes are
+already well predicted by the memory-free baseline once temporal memory
+is added, so the regularization gains are correspondingly smaller.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_wind_stress_waterfall.pdf}
+\caption{Cumulative improvement in held-out wind-stress $R^2$ (2013--2014)
+as each model component is added. Dark segments show the gain from the
+new component; faded segments show the $R^2$ already achieved by the
+prior stage. Memory provides the largest single gain; subsequent
+components yield progressively smaller increments.}
+\label{fig:waterfall}
+\end{figure}

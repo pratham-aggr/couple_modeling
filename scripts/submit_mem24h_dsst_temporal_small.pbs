@@ -1,11 +1,11 @@
 #!/bin/bash
-#PBS -N unet_mem24h_temporal
+#PBS -N unet_mem24h_dsst_temporal_small
 #PBS -A ucsd0044
 #PBS -q nvgpu
 #PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
 #PBS -l walltime=24:00:00
-#PBS -o /glade/u/home/praggarwal/couple/unet_mem24h_temporal.log
-#PBS -e /glade/u/home/praggarwal/couple/unet_mem24h_temporal.err
+#PBS -o /glade/u/home/praggarwal/couple/unet_mem24h_dsst_temporal_small.log
+#PBS -e /glade/u/home/praggarwal/couple/unet_mem24h_dsst_temporal_small.err
 #PBS -j oe
 
 COUPLE_DIR=/glade/u/home/praggarwal/couple
@@ -19,23 +19,21 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 
 cd ${COUPLE_DIR}
 
-# CAMulator-style temporal split (Chapman et al. 2025):
-#   train  1980-2010  (31 years, 88%)  normaliser computed on train only
-#   val    2011-2012  ( 2 years,  6%)  early stopping
-#   test   2013-2014  ( 2 years,  6%)  reported once after training
-echo "Starting mem24h + temporal split at $(date)"
+# Stage-1 lever: reduced capacity (base 32 instead of 64).
+echo "Starting mem24h + dSST/dt + temporal + BASE 32 at $(date)"
 python -u train_unet.py \
     --zarr_glob     "${ZARR_GLOB}" \
-    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_temporal \
+    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_dsst_temporal_small \
     --subsample     1.0 \
     --memory \
     --max_epochs    500 \
     --patience      40 \
     --batch         8 \
-    --base          64 \
+    --base          32 \
+    --dsst_dt \
     --scheduler     cosine \
     --split_mode    temporal \
-    --wandb_name    mem24h-temporal \
+    --wandb_name    mem24h-dsst-temporal-small \
     --wandb_project couple-unet
 
 echo "Done at $(date)"

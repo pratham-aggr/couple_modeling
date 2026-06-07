@@ -134,11 +134,13 @@ class PairDataset(Dataset):
     Also returns ocean_mask (H, W) bool for masked loss.
     """
 
-    def __init__(self, X_list, Y_list, mask_list, norm: Normalizer):
-        self.X    = X_list      # list of (n_in,  H, W) float32 arrays
-        self.Y    = Y_list      # list of (n_out, H, W) float32 arrays
-        self.mask = mask_list   # list of (H, W) bool arrays — True = ocean/ice
-        self.norm = norm
+    def __init__(self, X_list, Y_list, mask_list, norm: Normalizer,
+                 augment: bool = False):
+        self.X       = X_list      # list of (n_in,  H, W) float32 arrays
+        self.Y       = Y_list      # list of (n_out, H, W) float32 arrays
+        self.mask    = mask_list   # list of (H, W) bool arrays — True = ocean/ice
+        self.norm    = norm
+        self.augment = augment     # random longitudinal (W) roll — train only
 
     def __len__(self):
         return len(self.X)
@@ -149,9 +151,18 @@ class PairDataset(Dataset):
         m = self.mask[idx]
         x_n = (x - self.norm.x_mean[:, None, None]) / (self.norm.x_std[:, None, None] + 1e-8)
         y_n = (y - self.norm.y_mean[:, None, None]) / (self.norm.y_std[:, None, None] + 1e-8)
-        return (torch.from_numpy(x_n),
-                torch.from_numpy(y_n),
-                torch.from_numpy(m))
+        if self.augment:
+            # Circular shift along longitude (last axis). The grid is lon-periodic
+            # (see CircPad), so this is a physically exact, leakage-free augmentation.
+            # x_n/y_n share the same shift to stay aligned; mask too.
+            s = int(np.random.randint(0, x_n.shape[-1]))
+            if s:
+                x_n = np.roll(x_n, shift=s, axis=-1)
+                y_n = np.roll(y_n, shift=s, axis=-1)
+                m   = np.roll(m,   shift=s, axis=-1)
+        return (torch.from_numpy(np.ascontiguousarray(x_n)),
+                torch.from_numpy(np.ascontiguousarray(y_n)),
+                torch.from_numpy(np.ascontiguousarray(m)))
 
 
 # ---------------------------------------------------------------------------
@@ -693,10 +704,23 @@ def main():
     parser.add_argument("--dsst_dt", action="store_true",
                         help="Append (SST[t]-SST[t-lag])/86400 as an extra input channel. "
                              "Only meaningful with --memory. Stats computed from chosen samples.")
+    parser.add_argument("--augment", action="store_true",
+                        help="Random circular longitude (W) roll on the TRAINING set only. "
+                             "Physically exact (grid is lon-periodic); fights overfitting. "
+                             "Default off — old runs reproduce identically.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="AdamW/Muon weight decay (default 1e-4 — the previous "
+                             "hardcoded value, so old runs are unchanged).")
     parser.add_argument("--val_split_mode", choices=["random", "temporal"], default="random",
                         help="Val split: random (default, seed-42 permutation) or temporal "
                              "(hold out last 10%% by cache position as time proxy). "
-                             "Ignored when --val_years is set.")
+                             "Ignored when --split_mode temporal is set.")
+    parser.add_argument("--split_mode", choices=["random", "temporal"], default="random",
+                        help="random (default): existing 90/10 random split. "
+                             "temporal: year-based split following CAMulator (Chapman 2025) — "
+                             "train 1980-2010, val 2011-2012, test 2013-2014. "
+                             "Normaliser computed on training portion only (no leakage). "
+                             "Override year boundaries with --val_years / --test_years.")
     parser.add_argument("--val_years", type=int, nargs=2, default=None,
                         metavar=("START", "END"),
                         help="Year range for the validation set (e.g. 2010 2012). "
@@ -877,68 +901,21 @@ def main():
     else:
         years_all = np.array(years_all_list, dtype=np.int32)
 
-    # --- Normalizer ---
-    cached_norm = cache_dir / "normalizer.npz" if cache_ok else None
-    if cached_norm and cached_norm.exists():
-        print("Loading normalisation stats from cache ...")
-        norm_full = Normalizer.load(cached_norm)
-        # For memory experiments, slice to the selected input channels
-        if args.memory:
-            norm = Normalizer(norm_full.x_mean[mem_channels], norm_full.x_std[mem_channels],
-                              norm_full.y_mean, norm_full.y_std)
-        else:
-            norm = norm_full
-        if args.dsst_dt:
-            # dSST/dt is appended at position len(mem_channels) in each X_all sample
-            dsst_ch  = len(mem_channels)
-            dsst_all = np.stack([X_all[k][dsst_ch] for k in range(len(X_all))]).astype(np.float64)
-            dsst_mean = np.array([dsst_all.mean()],                    dtype=np.float32)
-            dsst_std  = np.array([max(dsst_all.std(), 1e-8)],          dtype=np.float32)
-            norm = Normalizer(
-                np.concatenate([norm.x_mean, dsst_mean]),
-                np.concatenate([norm.x_std,  dsst_std]),
-                norm.y_mean, norm.y_std,
-            )
-            print(f"  {'dSST_dt':10s}: mean={dsst_mean[0]:.4e}  std={dsst_std[0]:.4e}")
-
-        if args.with_co2:
-            # Extend normalizer with CO2 stats computed from the chosen samples
-            co2_vals = np.array([co2_np[i] for i in chosen], dtype=np.float32)
-            co2_mean = np.array([co2_vals.mean()], dtype=np.float32)
-            co2_std  = np.array([co2_vals.std() + 1e-8], dtype=np.float32)
-            norm = Normalizer(
-                np.concatenate([norm.x_mean, co2_mean]),
-                np.concatenate([norm.x_std,  co2_std]),
-                norm.y_mean, norm.y_std,
-            )
-    else:
-        print("Computing normalisation stats ...")
-        norm = compute_norm(X_all, Y_all)
-    norm.save(out_dir / "normalizer.npz")
-    for i, v in enumerate(input_vars):
-        print(f"  {v:10s}: mean={norm.x_mean[i]:.3f}  std={norm.x_std[i]:.3f}")
-    for i, v in enumerate(tgt_vars):
-        print(f"  {v:10s}: mean={norm.y_mean[i]:.4e}  std={norm.y_std[i]:.4e}")
-
-    # --- Train / val / test split ---
-    if args.val_years or args.test_years:
-        # Year-based temporal split — mutually exclusive masks
-        val_s,  val_e  = args.val_years  if args.val_years  else (99999, 99999)
-        test_s, test_e = args.test_years if args.test_years else (99999, 99999)
-        val_mask  = (years_all >= val_s)  & (years_all <= val_e)
-        test_mask = (years_all >= test_s) & (years_all <= test_e)
+    # --- Train / val / test split (before normaliser — training subset used for stats) ---
+    if args.split_mode == "temporal" or args.val_years or args.test_years:
+        val_s,  val_e  = args.val_years  if args.val_years  else (2011, 2012)
+        test_s, test_e = args.test_years if args.test_years else (2013, 2014)
+        val_mask   = (years_all >= val_s)  & (years_all <= val_e)
+        test_mask  = (years_all >= test_s) & (years_all <= test_e)
         train_mask = ~val_mask & ~test_mask
         ti       = np.where(train_mask)[0]
         vi       = np.where(val_mask)[0]
         test_idx = np.where(test_mask)[0]
         np.save(out_dir / "test_indices.npy", test_idx)
-        print(f"Year-based split:")
-        print(f"  Train: {len(ti):6d} samples  "
-              f"(years ≤ {val_s - 1})")
-        print(f"  Val:   {len(vi):6d} samples  "
-              f"(years {val_s}–{val_e})")
-        print(f"  Test:  {len(test_idx):6d} samples  "
-              f"(years {test_s}–{test_e})")
+        print(f"Temporal split  (CAMulator-style, no leakage):")
+        print(f"  Train: {len(ti):6d} samples  (years ≤ {val_s - 1})")
+        print(f"  Val:   {len(vi):6d} samples  (years {val_s}–{val_e})")
+        print(f"  Test:  {len(test_idx):6d} samples  (years {test_s}–{test_e})")
     else:
         test_idx = np.array([], dtype=int)
         n_val = max(1, len(X_all) // 10)
@@ -949,6 +926,62 @@ def main():
         else:
             idx = rng.permutation(len(X_all))
             vi, ti = idx[:n_val], idx[n_val:]
+
+    # --- Normalizer ---
+    # temporal split + precomputed out_dir/normalizer.npz → load it (no leakage, fast)
+    # temporal split, no precomputed file               → compute from training samples
+    # random split                                      → use all-years cache stats
+    precomp_norm = out_dir / "normalizer.npz"
+    cached_norm  = cache_dir / "normalizer.npz" if cache_ok else None
+    if args.split_mode == "temporal" and precomp_norm.exists():
+        print(f"Loading pre-computed training-only normaliser from {precomp_norm} ...")
+        norm = Normalizer.load(precomp_norm)
+    elif args.split_mode == "temporal":
+        print("Computing normalisation stats from training samples ...")
+        norm = compute_norm([X_all[k] for k in ti], [Y_all[k] for k in ti])
+        norm.save(precomp_norm)
+    else:
+        pass  # fall through to cache-based block below
+
+    use_cache_norm = (args.split_mode != "temporal" and
+                      cached_norm is not None and cached_norm.exists())
+    if use_cache_norm:
+        print("Loading normalisation stats from cache ...")
+        norm_full = Normalizer.load(cached_norm)
+        if args.memory:
+            norm = Normalizer(norm_full.x_mean[mem_channels], norm_full.x_std[mem_channels],
+                              norm_full.y_mean, norm_full.y_std)
+        else:
+            norm = norm_full
+        if args.dsst_dt:
+            dsst_ch  = len(mem_channels)
+            dsst_arr = np.stack([X_all[k][dsst_ch] for k in ti]).astype(np.float64)
+            dsst_mean = np.array([dsst_arr.mean()],             dtype=np.float32)
+            dsst_std  = np.array([max(dsst_arr.std(), 1e-8)],   dtype=np.float32)
+            norm = Normalizer(
+                np.concatenate([norm.x_mean, dsst_mean]),
+                np.concatenate([norm.x_std,  dsst_std]),
+                norm.y_mean, norm.y_std,
+            )
+            print(f"  {'dSST_dt':10s}: mean={dsst_mean[0]:.4e}  std={dsst_std[0]:.4e}")
+        if args.with_co2:
+            co2_vals = np.array([co2_np[chosen[k]] for k in ti], dtype=np.float32)
+            co2_mean = np.array([co2_vals.mean()], dtype=np.float32)
+            co2_std  = np.array([co2_vals.std() + 1e-8], dtype=np.float32)
+            norm = Normalizer(
+                np.concatenate([norm.x_mean, co2_mean]),
+                np.concatenate([norm.x_std,  co2_std]),
+                norm.y_mean, norm.y_std,
+            )
+    elif not use_cache_norm and args.split_mode != "temporal":
+        print("Computing normalisation stats ...")
+        norm = compute_norm(X_all, Y_all)
+    if not precomp_norm.exists():
+        norm.save(out_dir / "normalizer.npz")
+    for i, v in enumerate(input_vars):
+        print(f"  {v:10s}: mean={norm.x_mean[i]:.3f}  std={norm.x_std[i]:.3f}")
+    for i, v in enumerate(tgt_vars):
+        print(f"  {v:10s}: mean={norm.y_mean[i]:.4e}  std={norm.y_std[i]:.4e}")
 
     # --- Anomaly prediction (opt-in) ---
     clim        = None   # (12, n_out, H, W) monthly climatology
@@ -995,7 +1028,7 @@ def main():
         clim_torch = torch.from_numpy(clim).to(device)
 
     trn_ds = PairDataset([X_all[i] for i in ti], [Y_all[i] for i in ti],
-                         [mask_all[i] for i in ti], norm)
+                         [mask_all[i] for i in ti], norm, augment=args.augment)
     val_ds = PairDataset([X_all[i] for i in vi], [Y_all[i] for i in vi],
                          [mask_all[i] for i in vi], norm)
 
@@ -1063,12 +1096,12 @@ def main():
         # AdamW for biases, norm weights/biases (1D params)
         muon_params  = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
         adamw_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
-        optimizer = torch.optim.AdamW(adamw_params, lr=args.lr * 0.1, weight_decay=1e-4)
-        muon_opt  = Muon(muon_params, lr=args.lr, momentum=0.95, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(adamw_params, lr=args.lr * 0.1, weight_decay=args.weight_decay)
+        muon_opt  = Muon(muon_params, lr=args.lr, momentum=0.95, weight_decay=args.weight_decay)
         print(f"Muon: {len(muon_params)} 2D+ tensors, "
               f"AdamW: {len(adamw_params)} 1D tensors")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         muon_opt  = None
     total_epochs_for_sched = args.max_epochs if args.max_epochs > 0 else args.epochs
     if args.scheduler == "cosine":

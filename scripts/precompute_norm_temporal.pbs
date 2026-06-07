@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N precompute_norm_temporal
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -o /glade/u/home/praggarwal/couple/precompute_norm_temporal.log
+#PBS -e /glade/u/home/praggarwal/couple/precompute_norm_temporal.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "Job started: $(date), node=$(hostname)"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "Precomputing normaliser from training years 1980-2010 ..."
+python -u precompute_norm.py \
+    --cache_dir      /glade/work/praggarwal/couple_cache_mem24h \
+    --out_dir        ${COUPLE_DIR}/output_unet_mem24h_temporal \
+    --zarr_glob      "${ZARR_GLOB}" \
+    --train_end_year 2010 \
+    --mem_channels   0 1 2 3 4
+
+echo "Done at $(date)"
