@@ -24,7 +24,7 @@ MODELS = [
 
 present = []
 for label, d, color in MODELS:
-    f = ROOT / d / "r2_scores_test.json"
+    f = ROOT / "output" / d / "r2_scores_test.json"
     if f.exists():
         r2 = json.loads(f.read_text())
         present.append((label, [r2[v] for v in FLUXES], color))

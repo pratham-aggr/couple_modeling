@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N unet_ucast_s2
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=08:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2.err
+#PBS -j oe
+
+# U-Cast Stage 2: probabilistic CRPS fine-tuning with MC Dropout + Muon + EMA.
+# Loads Stage-1 MAE weights (weights-only -> fresh Muon optimizer, best_val reset),
+# fine-tunes on the unbiased CRPS estimator, and writes crps_ssr_test.json at the end.
+# Run AFTER submit_mem24h_ucast_s1.pbs (same out_dir), e.g.:
+#   qsub -W depend=afterok:<s1_jobid> scripts/submit_mem24h_ucast_s2.pbs
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "U-Cast Stage 2: CRPS fine-tuning (Muon + MC Dropout + EMA) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip_ucast \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --with_rad \
+    --with_precip \
+    --loss          crps \
+    --dropout       0.1 \
+    --crps_members  2 \
+    --optimizer     muon \
+    --lr            2e-3 \
+    --resume_weights_only \
+    --ema \
+    --eval_prob \
+    --eval_members  8 \
+    --max_epochs    50 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --wandb_name    mem24h-radprecip-ucast-s2-crps \
+    --wandb_project couple-unet
+
+echo "U-Cast Stage 2 done at $(date)"

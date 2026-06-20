@@ -1,0 +1,49 @@
+#!/bin/bash
+#PBS -N unet_ucast_s1
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s1.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s1.err
+#PBS -j oe
+
+# U-Cast Stage 1: deterministic MAE pre-training (8-output radprecip config,
+# temporal split, dropout 0.1, EMA). Mirrors submit_mem24h_dsst_temporal_radprecip
+# but with --loss mae --ema. Produces best_model.pt (EMA) + checkpoint.pt that
+# Stage 2 (submit_mem24h_ucast_s2.pbs) fine-tunes on CRPS.
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "U-Cast Stage 1: MAE pre-training (radprecip, temporal, dropout 0.1, EMA) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip_ucast \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --with_rad \
+    --with_precip \
+    --loss          mae \
+    --dropout       0.1 \
+    --ema \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --wandb_name    mem24h-radprecip-ucast-s1-mae \
+    --wandb_project couple-unet
+
+echo "U-Cast Stage 1 done at $(date)"

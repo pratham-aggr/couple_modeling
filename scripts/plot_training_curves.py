@@ -25,7 +25,7 @@ MODELS = [
 
 
 def load_history(out_dir):
-    ckpt_path = ROOT / out_dir / "checkpoint.pt"
+    ckpt_path = ROOT / "output" / out_dir / "checkpoint.pt"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     h = ckpt["history"]
     trn = [x[0] for x in h]

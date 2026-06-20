@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N unet_temporal_radprecip_oro_r
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=235GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_temporal_radprecip_oro_resume.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_temporal_radprecip_oro_resume.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Resume the 8-output rad+precip+statics(oro) run from checkpoint.pt (epoch 238)
+# to finish the cosine anneal -> 500. Resumes wandb run 43c29bi6.
+echo "Resuming mem24h + dSST/dt + temporal + AUGMENT + DROPOUT 0.1 + RAD + PRECIP + STATICS(oro) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip_oro \
+    --subsample     1.0 \
+    --memory \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --dsst_dt \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --statics \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --resume \
+    --wandb_name    mem24h-dsst-temporal-radprecip-oro \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"

@@ -15,7 +15,7 @@ padding along latitude, so it respects the global spherical geometry.
 Usage:
     python train_unet.py \\
         --zarr_glob "/glade/derecho/scratch/wchapman/b_credit_runs/*.zarr" \\
-        --out_dir ./output_unet \\
+        --out_dir ./output/output_unet \\
         [--subsample 0.2] [--epochs 30] [--batch 8] [--base 64] [--sixhour]
 """
 
@@ -40,6 +40,16 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 TARGET_VARS = ["TAUX", "TAUY", "SHFLX", "LHFLX", "QFLX"]
+# Optional extra targets appended when --with_rad: downward shortwave / longwave
+# radiation at the surface, in J m-2 per 6h step (read from the cache's Y_rad.npy).
+RAD_VARS    = ["FSDS_J", "FLDS_J"]
+# Optional extra target appended when --with_precip: total precipitation, in metres
+# liquid-equiv per 6h step (read from the cache's Y_precip.npy). Appended AFTER RAD_VARS.
+PRECIP_VARS = ["PRECT"]
+# Optional auxiliary targets appended when --with_atm: near-surface (bottom model
+# level) atmospheric state at t-1 — wind/temperature/humidity/surface-pressure
+# (read from the cache's Y_atm.npy). Appended LAST, after PRECIP_VARS.
+ATM_VARS    = ["Ubot", "Vbot", "Tbot", "Qbot", "PS"]
 INPUT_VARS  = ["SST", "ICEFRAC", "SOLIN"]
 H, W = 192, 288
 
@@ -376,6 +386,27 @@ def compute_norm(X_list, Y_list) -> Normalizer:
     return Normalizer(xm, xs, ym, ys)
 
 
+def load_statics(path, var_names, H, W):
+    """Load static input fields (constant in time) as a (S, H, W) float32 array.
+
+    Used to give the U-Net land/terrain context (orography) for better wind-stress
+    skill.  Fields must already be on the model's H x W grid (192x288, S->N).
+    """
+    ds = xr.open_dataset(path)
+    chans = []
+    for v in var_names:
+        if v not in ds:
+            raise KeyError(f"static var '{v}' not in {path}; have {list(ds.data_vars)}")
+        arr = np.asarray(ds[v].values, dtype=np.float32)
+        if arr.shape != (H, W):
+            raise ValueError(f"static '{v}' shape {arr.shape} != ({H},{W})")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"static '{v}' has non-finite values")
+        chans.append(arr)
+    ds.close()
+    return np.stack(chans, axis=0)   # (S, H, W)
+
+
 # ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
@@ -521,6 +552,169 @@ def compute_r2(model, loader, norm, device, n_out):
     return 1.0 - ss_res / (ss_tot + 1e-10)
 
 
+def compute_metrics(model, loader, norm, device, n_out):
+    """Per-variable R^2, RMSE, and Pearson correlation over ocean points.
+
+    Same gather/denormalize/mask path as compute_r2, but returns all three
+    metrics in one forward pass. Each value is a length-n_out numpy array,
+    aligned with tgt_vars. RMSE is in physical (de-normalized) units.
+    """
+    model.eval()
+    norm_y_std  = torch.tensor(norm.y_std,  device=device)
+    norm_y_mean = torch.tensor(norm.y_mean, device=device)
+
+    pred_all, true_all = [], []
+    with torch.no_grad():
+        for x_n, y_n, mask in loader:
+            pred = model(x_n.to(device)) * norm_y_std[None,:,None,None] + norm_y_mean[None,:,None,None]
+            true = y_n.to(device) * norm_y_std[None,:,None,None] + norm_y_mean[None,:,None,None]
+            m_flat = (mask.to(device) > 0.5).reshape(-1)
+            pred_all.append(pred.permute(0, 2, 3, 1).reshape(-1, n_out)[m_flat].cpu().numpy())
+            true_all.append(true.permute(0, 2, 3, 1).reshape(-1, n_out)[m_flat].cpu().numpy())
+    model.train()
+
+    pred_all = np.concatenate(pred_all, axis=0)   # (N_ocean, n_out)
+    true_all = np.concatenate(true_all, axis=0)
+
+    diff   = true_all - pred_all
+    ss_res = (diff ** 2).sum(axis=0)
+    ss_tot = ((true_all - true_all.mean(axis=0)) ** 2).sum(axis=0)
+    r2     = 1.0 - ss_res / (ss_tot + 1e-10)
+    rmse   = np.sqrt((diff ** 2).mean(axis=0))
+    tc     = true_all - true_all.mean(axis=0)
+    pc     = pred_all - pred_all.mean(axis=0)
+    corr   = (tc * pc).sum(axis=0) / (
+        np.sqrt((tc ** 2).sum(axis=0)) * np.sqrt((pc ** 2).sum(axis=0)) + 1e-10)
+    return {"r2": r2, "rmse": rmse, "corr": corr}
+
+
+# ---------------------------------------------------------------------------
+# U-Cast probabilistic eval + EMA  (all additive; gated by flags)
+# ---------------------------------------------------------------------------
+
+class ModelEMA:
+    """Exponential moving average of model weights (U-Cast uses EMA at inference).
+
+    Keeps a CPU/GPU shadow copy of the parameters + buffers; call update() after
+    each optimizer step.  apply_to()/restore() swap EMA weights in for evaluation
+    without disturbing the live training weights.
+    """
+    def __init__(self, model, decay=0.9999):
+        self.decay  = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        d = self.decay
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if v.dtype.is_floating_point:
+                s.mul_(d).add_(v.detach(), alpha=1.0 - d)
+            else:
+                s.copy_(v)            # int buffers (e.g. BN num_batches_tracked)
+
+    def apply_to(self, model):
+        self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+
+    def restore(self, model):
+        if self._backup is not None:
+            model.load_state_dict(self._backup, strict=True)
+            self._backup = None
+
+    def state_dict(self):
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, sd):
+        self.decay  = sd.get("decay", self.decay)
+        self.shadow = sd["shadow"]
+
+
+def enable_mc_dropout(model):
+    """Put model in eval mode but RE-ENABLE only the Dropout layers (MC Dropout).
+
+    Critical: a plain model.train() would also switch BatchNorm to batch statistics
+    and corrupt predictions.  We keep BN (and everything else) in eval mode and turn
+    on only nn.Dropout/Dropout2d so each forward pass samples a different mask.
+    """
+    model.eval()
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+            m.train()
+
+
+def compute_crps_ssr(model, loader, norm, device, n_out, n_members=8, lat_w=None):
+    """Probabilistic metrics over ocean/ice points via BN-safe MC Dropout.
+
+    Draws `n_members` stochastic forward passes per batch and returns, per variable:
+      - CRPS  : unbiased estimator skill - 0.5*spread (Zamo & Naveau 2018), in
+                physical units (denormalised), lat-weighted if lat_w given.
+      - SSR   : spread-skill ratio = mean ensemble spread / ensemble-mean RMSE
+                (well-calibrated ≈ 1.0; under-dispersive < 1).
+      - R2    : deterministic R² of the ENSEMBLE MEAN (for reference).
+    Works for a deterministic model too (dropout=0 → members identical → spread 0,
+    CRPS = MAE, SSR = 0) so the MSE baseline can be scored on the same footing.
+    """
+    enable_mc_dropout(model)
+    ys = torch.tensor(norm.y_std,  device=device).view(1, -1, 1, 1)
+    ym = torch.tensor(norm.y_mean, device=device).view(1, -1, 1, 1)
+    if lat_w is not None:
+        lat_w = lat_w.to(device)
+
+    # accumulators (per variable, in physical units)
+    crps_num = np.zeros(n_out); wsum = 0.0
+    sk_num   = np.zeros(n_out)            # ensemble-mean abs error (for SSR denom via RMSE)
+    se_num   = np.zeros(n_out)            # ensemble-mean squared error
+    sp_num   = np.zeros(n_out)            # mean pairwise spread
+    # R² of ensemble mean (gather flattened ocean points)
+    pred_all, true_all = [], []
+
+    with torch.no_grad():
+        for x_n, y_n, mask in loader:
+            x_n, y_n, mask = x_n.to(device), y_n.to(device), mask.to(device)
+            preds = [model(x_n) * ys + ym for _ in range(n_members)]   # physical units
+            true  = y_n * ys + ym
+            M     = len(preds)
+            mean  = sum(preds) / M
+
+            m     = mask.unsqueeze(1)
+            m_eff = m * lat_w if lat_w is not None else m
+            w     = m_eff.sum().item() + 1e-8
+            wsum += w
+
+            skill  = sum(torch.abs(p - true) for p in preds) / M
+            if M > 1:
+                spread = sum(torch.abs(preds[i] - preds[j])
+                             for i in range(M) for j in range(M) if i != j) / (M * (M - 1))
+            else:
+                spread = torch.zeros_like(skill)
+            crps   = skill - 0.5 * spread
+            mae_m  = torch.abs(mean - true)
+            se_m   = (mean - true) ** 2
+
+            for v in range(n_out):
+                crps_num[v] += (crps[:, v:v+1]   * m_eff).sum().item()
+                sk_num[v]   += (mae_m[:, v:v+1]  * m_eff).sum().item()
+                se_num[v]   += (se_m[:, v:v+1]   * m_eff).sum().item()
+                sp_num[v]   += (spread[:, v:v+1] * m_eff).sum().item()
+
+            mf        = (mask > 0.5).reshape(-1)
+            pred_all.append(mean.permute(0, 2, 3, 1).reshape(-1, n_out)[mf].cpu().numpy())
+            true_all.append(true.permute(0, 2, 3, 1).reshape(-1, n_out)[mf].cpu().numpy())
+
+    model.eval()
+    crps = crps_num / wsum
+    rmse = np.sqrt(se_num / wsum)                       # ensemble-mean RMSE
+    spr  = sp_num / wsum                                # mean spread
+    ssr  = spr / (rmse + 1e-10)
+    pred_all = np.concatenate(pred_all); true_all = np.concatenate(true_all)
+    ss_res = ((true_all - pred_all) ** 2).sum(0)
+    ss_tot = ((true_all - true_all.mean(0)) ** 2).sum(0)
+    r2 = 1.0 - ss_res / (ss_tot + 1e-10)
+    return {"crps": crps, "ssr": ssr, "r2_ensmean": r2}
+
+
 # ---------------------------------------------------------------------------
 # Wandb map logging  (follows climatebench's create_wandb_figures pattern)
 # ---------------------------------------------------------------------------
@@ -630,7 +824,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--zarr_glob", required=True,
                         help="Glob pattern for zarr stores (e.g. '/path/*.zarr')")
-    parser.add_argument("--out_dir",   default="./output_unet")
+    parser.add_argument("--out_dir",   default="./output/output_unet")
     parser.add_argument("--subsample", type=float, default=0.2,
                         help="Fraction of daily pairs to use per year (default 0.2)")
     parser.add_argument("--epochs",    type=int,   default=30)
@@ -650,6 +844,19 @@ def main():
     parser.add_argument("--with_co2", action="store_true",
                         help="Add co2vmr as an extra input channel (broadcast globally). "
                              "Requires co2.npy in the cache dir.")
+    parser.add_argument("--with_rad", action="store_true",
+                        help="Add downward SW/LW radiation (FSDS_J, FLDS_J, J/m2) as 2 extra "
+                             "output channels. Requires Y_rad.npy in the cache dir "
+                             "(run add_rad_to_cache.py first). Default off — old runs unchanged.")
+    parser.add_argument("--with_precip", action="store_true",
+                        help="Add total precipitation (PRECT, m/6h) as 1 extra output channel, "
+                             "appended after the radiation channels. Requires Y_precip.npy in "
+                             "the cache dir (run add_precip_to_cache.py first). Default off.")
+    parser.add_argument("--with_atm", action="store_true",
+                        help="Add near-surface atmospheric state at t-1 (Ubot, Vbot, Tbot, "
+                             "Qbot, PS) as 5 auxiliary output channels, appended LAST. Requires "
+                             "Y_atm.npy in the cache dir (run add_atm_to_cache.py first). "
+                             "Default off — old runs unchanged.")
     parser.add_argument("--memory", action="store_true",
                         help="Memory experiment: X = [state_t, state_{t-Nh}] → Y = fluxes_t. "
                              "Uses couple_cache_mem{N}h (6 channels stored; training selects subset).")
@@ -704,6 +911,18 @@ def main():
     parser.add_argument("--dsst_dt", action="store_true",
                         help="Append (SST[t]-SST[t-lag])/86400 as an extra input channel. "
                              "Only meaningful with --memory. Stats computed from chosen samples.")
+    parser.add_argument("--statics", action="store_true",
+                        help="Append static orography fields as extra input channels "
+                             "(broadcast, constant in time): improves wind-stress skill near "
+                             "coasts/terrain. Read from --statics_file; appended last (after "
+                             "dSST_dt/CO2). Default off — old runs reproduce identically.")
+    parser.add_argument("--statics_file", type=str,
+                        default="/glade/derecho/scratch/wchapman/b_credit_runs/statics_b_credit_runs_f32_02.nc",
+                        help="NetCDF with static fields on the 192x288 S->N grid (only with --statics).")
+    parser.add_argument("--statics_vars", type=str, nargs="+",
+                        default=["z_norm", "LANDM_COSLAT"],
+                        help="Static variable names to read from --statics_file (default: "
+                             "z_norm LANDM_COSLAT). Appended in this order.")
     parser.add_argument("--augment", action="store_true",
                         help="Random circular longitude (W) roll on the TRAINING set only. "
                              "Physically exact (grid is lon-periodic); fights overfitting. "
@@ -734,6 +953,25 @@ def main():
                         help="Skip training: load best_model.pt and report R² on the test set "
                              "defined by test_indices.npy (requires a completed training run "
                              "with --test_years).")
+    # --- U-Cast probabilistic eval + EMA (all default-off → old runs unchanged) ---
+    parser.add_argument("--ema", action="store_true",
+                        help="Maintain an exponential-moving-average of weights (U-Cast uses "
+                             "EMA at inference). When set, eval + best_model.pt use EMA weights "
+                             "(raw saved as best_model_raw.pt). Default off — old runs unchanged.")
+    parser.add_argument("--ema_decay", type=float, default=0.9999,
+                        help="EMA decay (U-Cast: 0.9999). Only used with --ema.")
+    parser.add_argument("--eval_prob", action="store_true",
+                        help="Compute probabilistic metrics (CRPS, spread-skill ratio SSR, "
+                             "ensemble-mean R²) via BN-safe MC Dropout. In --eval_test, writes "
+                             "crps_ssr_test.json; during training, logs val CRPS/SSR each epoch. "
+                             "Selection metric is unchanged. Default off.")
+    parser.add_argument("--eval_members", type=int, default=8,
+                        help="MC Dropout ensemble size for --eval_prob (default 8).")
+    parser.add_argument("--resume_weights_only", action="store_true",
+                        help="Like --resume but load ONLY model weights (+best_val) from "
+                             "checkpoint.pt, skipping optimizer/scheduler state. Lets Stage 2 "
+                             "switch optimizer (e.g. to Muon) without a param-group mismatch. "
+                             "Default off.")
     args = parser.parse_args()
 
     if args.dsst_dt and not args.memory:
@@ -758,7 +996,8 @@ def main():
         input_vars_base = INPUT_VARS
     input_vars = (input_vars_base
                   + (["dSST_dt"] if args.dsst_dt else [])
-                  + (["CO2"]     if args.with_co2 else []))
+                  + (["CO2"]     if args.with_co2 else [])
+                  + (list(args.statics_vars) if args.statics else []))
 
     use_wandb = WANDB_AVAILABLE and args.wandb_project is not None
     if use_wandb:
@@ -826,6 +1065,18 @@ def main():
     # Discover which target vars are actually present
     ds0 = xr.open_zarr(zarr_paths[0], consolidated=False)
     tgt_vars = [v for v in TARGET_VARS if v in ds0.data_vars]
+    if args.with_rad:
+        # Radiation targets are stored alongside the 5 fluxes (cache: Y_rad.npy;
+        # zarr branch: read straight from the store), appended after them.
+        tgt_vars = tgt_vars + [v for v in RAD_VARS if v in ds0.data_vars]
+    if args.with_precip:
+        # Precipitation appended last (cache: Y_precip.npy; zarr branch: from store).
+        tgt_vars = tgt_vars + [v for v in PRECIP_VARS if v in ds0.data_vars]
+    if args.with_atm:
+        # Auxiliary near-surface atm state at t-1 (cache: Y_atm.npy). These are
+        # derived channel names (bottom model level of U/V/T/Q + PS), not raw zarr
+        # vars, so append directly without the data_vars membership filter.
+        tgt_vars = tgt_vars + ATM_VARS
     ds0.close()
     n_out = len(tgt_vars)
     print(f"Input vars:  {input_vars}")
@@ -859,10 +1110,32 @@ def main():
             assert co2_path.exists(), "co2.npy not found — run add_co2_to_cache.py first"
             co2_np = np.load(co2_path, mmap_mode="r")              # (N,)
             print("  CO2 channel enabled")
+        yrad_np = None
+        if args.with_rad:
+            yrad_path = cache_dir / "Y_rad.npy"
+            assert yrad_path.exists(), "Y_rad.npy not found — run add_rad_to_cache.py first"
+            yrad_np = np.load(yrad_path, mmap_mode="r")            # (N, 2, H, W)
+            print(f"  Radiation targets enabled: {RAD_VARS}")
+        yprecip_np = None
+        if args.with_precip:
+            yprecip_path = cache_dir / "Y_precip.npy"
+            assert yprecip_path.exists(), "Y_precip.npy not found — run add_precip_to_cache.py first"
+            yprecip_np = np.load(yprecip_path, mmap_mode="r")      # (N, 1, H, W)
+            print(f"  Precipitation target enabled: {PRECIP_VARS}")
+        yatm_np = None
+        if args.with_atm:
+            yatm_path = cache_dir / "Y_atm.npy"
+            assert yatm_path.exists(), "Y_atm.npy not found — run add_atm_to_cache.py first"
+            yatm_np = np.load(yatm_path, mmap_mode="r")            # (N, 5, H, W)
+            print(f"  Auxiliary atm targets enabled (t-1): {ATM_VARS}")
         N_full  = len(X_np)
         # Apply subsample via random selection
         chosen = rng.choice(N_full, size=max(1, int(N_full * args.subsample)), replace=False)
         chosen.sort()
+        statics = None
+        if args.statics:
+            statics = load_statics(args.statics_file, args.statics_vars, H, W)
+            print(f"  Static channels enabled: {args.statics_vars}  shape={statics.shape}")
         X_all = []
         for i in chosen:
             x = X_np[i][mem_channels] if args.memory else X_np[i]
@@ -872,11 +1145,22 @@ def main():
                 x = np.concatenate([x, dsst], axis=0)
             if args.with_co2:
                 x = np.concatenate([x, np.full((1, H, W), co2_np[i], dtype=np.float32)], axis=0)
+            if statics is not None:
+                x = np.concatenate([x, statics], axis=0)   # appended last (constant in time)
             X_all.append(x.copy())
-        Y_all    = [Y_np[i].copy()    for i in chosen]
+        _extra_y = [e for e in (yrad_np, yprecip_np, yatm_np) if e is not None]
+        if _extra_y:
+            Y_all = [np.concatenate([Y_np[i]] + [e[i] for e in _extra_y], axis=0).copy()
+                     for i in chosen]
+        else:
+            Y_all = [Y_np[i].copy()    for i in chosen]
         mask_all = [mask_np[i].copy() for i in chosen]
         print(f"  Loaded {len(X_all)} / {N_full} samples in {time_module.time()-t0:.1f}s")
     else:
+        if args.statics:
+            raise NotImplementedError(
+                "--statics is only wired through the cache path (use --memory with a "
+                "precomputed cache). Build the cache first, then rerun with --statics.")
         print("\nLoading data from zarr ...")
         X_all, Y_all, mask_all = [], [], []
         years_all_list = []
@@ -973,6 +1257,18 @@ def main():
                 np.concatenate([norm.x_std,  co2_std]),
                 norm.y_mean, norm.y_std,
             )
+        if args.statics:
+            # statics are constant in time -> per-sample stats = spatial mean/std
+            st = load_statics(args.statics_file, args.statics_vars, H, W)   # (S,H,W)
+            st_flat  = st.reshape(st.shape[0], -1)
+            st_mean  = st_flat.mean(axis=1).astype(np.float32)
+            st_std   = (st_flat.std(axis=1) + 1e-8).astype(np.float32)
+            norm = Normalizer(
+                np.concatenate([norm.x_mean, st_mean]),
+                np.concatenate([norm.x_std,  st_std]),
+                norm.y_mean, norm.y_std,
+            )
+            print(f"  statics stats: mean={st_mean} std={st_std}")
     elif not use_cache_norm and args.split_mode != "temporal":
         print("Computing normalisation stats ...")
         norm = compute_norm(X_all, Y_all)
@@ -1064,15 +1360,43 @@ def main():
         print("\n[eval_test] Loading best checkpoint ...")
         model.load_state_dict(torch.load(out_dir / "best_model.pt",
                                          map_location=device, weights_only=True))
-        print("[eval_test] Computing R² on test set ...")
-        r2_test = compute_r2(model, test_loader, norm, device, n_out)
-        r2_test_dict = {v: float(r2_test[i]) for i, v in enumerate(tgt_vars)}
+        print("[eval_test] Computing test metrics (R², RMSE, corr) ...")
+        mt = compute_metrics(model, test_loader, norm, device, n_out)
+        r2_test_dict = {v: float(mt["r2"][i]) for i, v in enumerate(tgt_vars)}
+        metrics_test = {v: {"r2":   float(mt["r2"][i]),
+                            "rmse": float(mt["rmse"][i]),
+                            "corr": float(mt["corr"][i])}
+                        for i, v in enumerate(tgt_vars)}
+        json.dump(metrics_test, open(out_dir / "metrics_test.json", "w"), indent=2)
         json.dump(r2_test_dict, open(out_dir / "r2_scores_test.json", "w"), indent=2)
-        print("Test R² scores (ocean/ice points):")
-        for v, s in r2_test_dict.items():
-            print(f"  {v:10s}: {s:.4f}")
+        print(f"Test metrics (ocean/ice points):\n  {'var':10s} {'R2':>8s} {'RMSE':>12s} {'corr':>8s}")
+        for v in tgt_vars:
+            d = metrics_test[v]
+            print(f"  {v:10s} {d['r2']:8.4f} {d['rmse']:12.4e} {d['corr']:8.4f}")
         if use_wandb:
-            wandb.log({f"test/r2_{v}": s for v, s in r2_test_dict.items()})
+            wandb.log({f"test/r2_{v}":   metrics_test[v]["r2"]   for v in tgt_vars}
+                      | {f"test/rmse_{v}": metrics_test[v]["rmse"] for v in tgt_vars}
+                      | {f"test/corr_{v}": metrics_test[v]["corr"] for v in tgt_vars})
+
+        # Probabilistic metrics (CRPS / SSR / ensemble-mean R²) via BN-safe MC Dropout.
+        if args.eval_prob:
+            print(f"[eval_test] Computing CRPS/SSR on test set ({args.eval_members} members) ...")
+            prob = compute_crps_ssr(model, test_loader, norm, device, n_out,
+                                    n_members=args.eval_members)
+            prob_dict = {v: {"crps": float(prob["crps"][i]),
+                             "ssr":  float(prob["ssr"][i]),
+                             "r2_ensmean": float(prob["r2_ensmean"][i])}
+                         for i, v in enumerate(tgt_vars)}
+            json.dump(prob_dict, open(out_dir / "crps_ssr_test.json", "w"), indent=2)
+            print(f"Test probabilistic scores ({args.eval_members}-member MC Dropout):")
+            print(f"  {'var':10s} {'CRPS':>10s} {'SSR':>7s} {'R2(mean)':>9s}")
+            for v in tgt_vars:
+                d = prob_dict[v]
+                print(f"  {v:10s} {d['crps']:10.4f} {d['ssr']:7.3f} {d['r2_ensmean']:9.4f}")
+            if use_wandb:
+                wandb.log({f"test/crps_{v}": prob_dict[v]["crps"] for v in tgt_vars}
+                          | {f"test/ssr_{v}": prob_dict[v]["ssr"] for v in tgt_vars})
+        if use_wandb:
             wandb.finish()
         return
 
@@ -1119,9 +1443,20 @@ def main():
     best_val    = float("inf")
 
     ckpt_path = out_dir / "checkpoint.pt"
-    if args.resume and ckpt_path.exists():
+    _ckpt = None
+    if args.resume_weights_only and ckpt_path.exists():
+        # Stage transition (e.g. MAE -> CRPS, optimizer switch): take ONLY the
+        # pretrained weights.  Fresh optimizer/scheduler; reset best_val since the
+        # new loss (CRPS) is not comparable to the Stage-1 (MAE) value.
+        print(f"Loading WEIGHTS ONLY from {ckpt_path} (fresh optimizer/scheduler) ...")
+        _ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(_ckpt["model"])
+        print(f"  Loaded Stage-1 weights (was epoch {_ckpt.get('epoch','?')}); "
+              f"fine-tuning from epoch 1, best_val reset")
+    elif args.resume and ckpt_path.exists():
         print(f"Resuming from {ckpt_path} ...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        _ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = _ckpt
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if muon_opt is not None and "muon_opt" in ckpt:
@@ -1131,6 +1466,15 @@ def main():
         best_val    = ckpt["best_val"]
         history     = ckpt["history"]
         print(f"  Resumed at epoch {start_epoch}/{args.epochs}, best_val={best_val:.4f}")
+
+    # EMA of weights (U-Cast inference trick). Init from the (possibly loaded)
+    # weights; resume the shadow only on a full --resume that carries one.
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    if ema is not None and args.resume and _ckpt is not None and "ema" in _ckpt:
+        ema.load_state_dict(_ckpt["ema"])
+        print(f"  EMA shadow resumed (decay={ema.decay})")
+    elif ema is not None:
+        print(f"  EMA enabled (decay={ema.decay})")
 
     # --- Training loop ---
     total_epochs = args.max_epochs if args.max_epochs > 0 else (args.epochs + args.extra_epochs)
@@ -1177,7 +1521,14 @@ def main():
             optimizer.step()
             if muon_opt is not None:
                 muon_opt.step()
+            if ema is not None:
+                ema.update(model)
             trn_loss += loss.item()
+
+        # Evaluate on EMA weights when enabled (U-Cast inference trick); restore
+        # the live training weights afterwards.
+        if ema is not None:
+            ema.apply_to(model)
 
         val_loss    = 0.0
         val_loss_pv = np.zeros(n_out)   # per-variable accumulator
@@ -1215,6 +1566,13 @@ def main():
                         for vi in range(n_out):
                             val_loss_pv[vi] += (((pred[:,vi:vi+1] - y_n[:,vi:vi+1])**2) * m_eff).sum().item() / n_pts.item()
 
+        # Optional BN-safe probabilistic metrics for logging (does not change the
+        # selection metric). Uses EMA weights if they're currently applied.
+        prob_val = None
+        if args.eval_prob:
+            prob_val = compute_crps_ssr(model, val_loader, norm, device, n_out,
+                                        n_members=args.eval_members, lat_w=lat_w)
+
         trn_loss    /= len(trn_loader)
         val_loss    /= max(1, len(val_loader))
         val_loss_pv /= max(1, len(val_loader))
@@ -1225,9 +1583,17 @@ def main():
         if improved:
             best_val   = val_loss
             no_improve = 0
+            # When --ema, model currently holds EMA weights → best_model.pt is EMA.
             torch.save(model.state_dict(), out_dir / "best_model.pt")
         else:
             no_improve += 1
+
+        # Restore the live training weights (no-op when --ema is off). Optionally
+        # snapshot the raw (non-EMA) best weights too.
+        if ema is not None:
+            if improved:
+                torch.save(ema._backup, out_dir / "best_model_raw.pt")
+            ema.restore(model)
 
         # SGDR warm restart resets the LR to its peak — don't penalise the
         # transient val spike that follows; reset patience at each restart.
@@ -1246,6 +1612,8 @@ def main():
         }
         if muon_opt is not None:
             ckpt_dict["muon_opt"] = muon_opt.state_dict()
+        if ema is not None:
+            ckpt_dict["ema"] = ema.state_dict()
         torch.save(ckpt_dict, out_dir / "checkpoint.pt")
 
         es_tag = f"  no_improve={no_improve}/{args.patience}" if early_stop else ""
@@ -1268,6 +1636,10 @@ def main():
                 log_dict[f"val/loss_{vname}"] = val_loss_pv[vi]
                 if var_w is not None:
                     log_dict[f"val/wloss_{vname}"] = args.loss_weights[vi] * val_loss_pv[vi]
+            if prob_val is not None:
+                for vi, vname in enumerate(tgt_vars):
+                    log_dict[f"val/crps_{vname}"] = float(prob_val["crps"][vi])
+                    log_dict[f"val/ssr_{vname}"]  = float(prob_val["ssr"][vi])
             wandb.log(log_dict, step=epoch)
             if epoch % 10 == 0:
                 _log_wandb_maps(model, val_ds, norm, device, tgt_vars, n_samples=4, step=epoch)
@@ -1301,18 +1673,47 @@ def main():
     if use_wandb:
         wandb.log({f"val/r2_{v}": s for v, s in r2_dict.items()})
 
-    # --- R² on held-out test set ---
+    # --- R²/RMSE/correlation on held-out test set ---
     if test_loader is not None:
-        print("\nComputing R² scores on test set (ocean points only) ...")
-        r2_test = compute_r2(model, test_loader, norm, device, n_out)
-        r2_test_dict = {v: float(r2_test[i]) for i, v in enumerate(tgt_vars)}
+        print("\nComputing test-set metrics (R², RMSE, corr; ocean points only) ...")
+        mt = compute_metrics(model, test_loader, norm, device, n_out)
+        r2_test_dict = {v: float(mt["r2"][i]) for i, v in enumerate(tgt_vars)}
+        # Per-variable R²/RMSE/corr, keyed by variable name.
+        metrics_test = {v: {"r2":   float(mt["r2"][i]),
+                            "rmse": float(mt["rmse"][i]),
+                            "corr": float(mt["corr"][i])}
+                        for i, v in enumerate(tgt_vars)}
+        json.dump(metrics_test, open(out_dir / "metrics_test.json", "w"), indent=2)
+        # Keep r2_scores_test.json for backward compatibility with older tooling.
         json.dump(r2_test_dict, open(out_dir / "r2_scores_test.json", "w"), indent=2)
-        print("Test R² scores (ocean/ice points):")
-        for v, s in r2_test_dict.items():
-            print(f"  {v:10s}: {s:.4f}")
+        print(f"Test metrics (ocean/ice points):\n  {'var':10s} {'R2':>8s} {'RMSE':>12s} {'corr':>8s}")
+        for v in tgt_vars:
+            d = metrics_test[v]
+            print(f"  {v:10s} {d['r2']:8.4f} {d['rmse']:12.4e} {d['corr']:8.4f}")
         if use_wandb:
-            wandb.log({f"test/r2_{v}": s for v, s in r2_test_dict.items()})
-        _log_rmse_maps(model, val_loader, norm, device, tgt_vars, step=epoch)
+            wandb.log({f"test/r2_{v}":   metrics_test[v]["r2"]   for v in tgt_vars}
+                      | {f"test/rmse_{v}": metrics_test[v]["rmse"] for v in tgt_vars}
+                      | {f"test/corr_{v}": metrics_test[v]["corr"] for v in tgt_vars})
+            _log_rmse_maps(model, val_loader, norm, device, tgt_vars, step=epoch)
+
+        # Probabilistic test metrics (CRPS/SSR) on the best (EMA) weights.
+        if args.eval_prob:
+            print(f"\nComputing CRPS/SSR on test set ({args.eval_members} members) ...")
+            prob = compute_crps_ssr(model, test_loader, norm, device, n_out,
+                                    n_members=args.eval_members)
+            prob_dict = {v: {"crps": float(prob["crps"][i]),
+                             "ssr":  float(prob["ssr"][i]),
+                             "r2_ensmean": float(prob["r2_ensmean"][i])}
+                         for i, v in enumerate(tgt_vars)}
+            json.dump(prob_dict, open(out_dir / "crps_ssr_test.json", "w"), indent=2)
+            print(f"Test probabilistic scores ({args.eval_members}-member MC Dropout):")
+            print(f"  {'var':10s} {'CRPS':>10s} {'SSR':>7s} {'R2(mean)':>9s}")
+            for v in tgt_vars:
+                d = prob_dict[v]
+                print(f"  {v:10s} {d['crps']:10.4f} {d['ssr']:7.3f} {d['r2_ensmean']:9.4f}")
+            if use_wandb:
+                wandb.log({f"test/crps_{v}": prob_dict[v]["crps"] for v in tgt_vars}
+                          | {f"test/ssr_{v}": prob_dict[v]["ssr"] for v in tgt_vars})
 
     # --- Plots ---
     trn_h = [h[0] for h in history]

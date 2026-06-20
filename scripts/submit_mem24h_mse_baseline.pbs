@@ -1,0 +1,45 @@
+#!/bin/bash
+#PBS -N unet_mse_baseline
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=235GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_mse_baseline.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_mse_baseline.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+# MATCHED BASELINE: 8 flux targets only (no --with_atm). Identical config to the
+# atm-aux experiment so the TAUX/TAUY comparison isolates the auxiliary atm head.
+echo "Starting mem24h + dSST/dt + AUGMENT + DROPOUT 0.1 + RAD + PRECIP MSE (baseline) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_mse_baseline \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --wandb_name    mem24h-mse-baseline \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"

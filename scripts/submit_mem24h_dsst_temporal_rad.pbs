@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N unet_mem24h_dsst_temporal_rad
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=235GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_temporal_rad.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_temporal_rad.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Best config (combo: dropout 0.1 + longitudinal augment, base 64), temporal split,
+# now predicting 7 outputs: TAUX TAUY SHFLX LHFLX QFLX + FSDS_J FLDS_J (J/m2).
+# 7-channel Y pushes the in-RAM dataset past 128GB -> request 235GB.
+# 500-epoch cosine may exceed 24h walltime; checkpoint.pt is saved each epoch ->
+# resume with --resume to finish the anneal.
+echo "Starting mem24h + dSST/dt + temporal + AUGMENT + DROPOUT 0.1 + RAD outputs at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_rad \
+    --subsample     1.0 \
+    --memory \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --dsst_dt \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --wandb_name    mem24h-dsst-temporal-rad \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"

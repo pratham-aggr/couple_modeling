@@ -1,0 +1,53 @@
+#!/bin/bash
+#PBS -N unet_ucast_eval
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB:gpu_type=a100
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_ucast_eval.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_ucast_eval.err
+#PBS -j oe
+
+# Fair probabilistic comparison: run --eval_test --eval_prob (BN-safe MC Dropout)
+# on BOTH the new U-Cast model and the existing MSE radprecip baseline, writing
+# crps_ssr_test.json into each dir, then print a side-by-side CRPS/SSR table.
+# Both models were trained with dropout 0.1 so both can produce an MC ensemble;
+# the U-Cast (CRPS-tuned) one should have lower CRPS and SSR closer to 1.0.
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+UCAST=${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip_ucast
+BASE=${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+# (no --wandb_project -> wandb stays off)
+COMMON=(--zarr_glob "${ZARR_GLOB}" --subsample 1.0 --memory --dsst_dt
+        --with_rad --with_precip --split_mode temporal --base 64 --batch 8
+        --dropout 0.1 --eval_test --eval_prob --eval_members 8)
+
+for DIR in "$BASE" "$UCAST"; do
+    echo "=== eval_prob on $DIR at $(date) ==="
+    python -u train_unet.py --out_dir "$DIR" "${COMMON[@]}"
+done
+
+echo ""
+echo "================= CRPS / SSR comparison (test set) ================="
+python - "$BASE/crps_ssr_test.json" "$UCAST/crps_ssr_test.json" <<'PY'
+import json, sys
+base = json.load(open(sys.argv[1])); ucast = json.load(open(sys.argv[2]))
+print(f"{'var':10s} {'CRPS_base':>10s} {'CRPS_ucast':>11s} {'dCRPS%':>8s} "
+      f"{'SSR_base':>9s} {'SSR_ucast':>10s}")
+for v in base:
+    cb, cu = base[v]['crps'], ucast[v]['crps']
+    d = 100.0*(cu-cb)/(abs(cb)+1e-12)
+    print(f"{v:10s} {cb:10.4f} {cu:11.4f} {d:+8.1f} "
+          f"{base[v]['ssr']:9.3f} {ucast[v]['ssr']:10.3f}")
+print("\nLower CRPS (negative dCRPS%) and SSR closer to 1.0 = U-Cast wins.")
+PY
+echo "Done at $(date)"

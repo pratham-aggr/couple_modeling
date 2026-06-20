@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N unet_base_prob
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB:gpu_type=a100
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_base_prob.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_base_prob.err
+#PBS -j oe
+
+# Standalone: compute CRPS/SSR on the EXISTING MSE radprecip baseline now, to
+# (1) validate the new --eval_prob path on real data/model early, and
+# (2) pre-compute the baseline half of the comparison.
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+BASE=${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -u train_unet.py --out_dir "$BASE" \
+    --zarr_glob "${ZARR_GLOB}" --subsample 1.0 --memory --dsst_dt \
+    --with_rad --with_precip --split_mode temporal --base 64 --batch 8 \
+    --dropout 0.1 --eval_test --eval_prob --eval_members 8
+
+echo "Baseline CRPS/SSR written to $BASE/crps_ssr_test.json at $(date)"

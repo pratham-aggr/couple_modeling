@@ -4,8 +4,8 @@
 #PBS -q casper
 #PBS -l select=1:ncpus=8:mem=64GB
 #PBS -l walltime=04:00:00
-#PBS -o /glade/u/home/praggarwal/couple/preprocess_mem72h.log
-#PBS -e /glade/u/home/praggarwal/couple/preprocess_mem72h.err
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/preprocess_mem72h.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/preprocess_mem72h.err
 #PBS -j oe
 
 set -euo pipefail

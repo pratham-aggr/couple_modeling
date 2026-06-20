@@ -125,7 +125,7 @@ if [[ "$1" != "nobuild" ]]; then
     echo "    Run directory: ${RUNDIR}"
     echo ""
     echo "Next steps:"
-    echo "  1. Copy fake_atm_server.py and output_full/ to ${RUNDIR}"
+    echo "  1. Copy fake_atm_server.py and output/output_full/ to ${RUNDIR}"
     echo "  2. Start submit_fake_atm_server.pbs on Casper (GPU node)"
     echo "  3. Wait for camulator_server_ready.flag in ${RUNDIR}"
     echo "  4. Then: cd ${CASE_DIR} && ./case.submit"

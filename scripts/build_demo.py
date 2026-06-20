@@ -74,12 +74,12 @@ def build_input(x6, kind):
 
 
 def load_model(out_dir, kind, dropout):
-    cfg = json.loads((ROOT / out_dir / "model_config.json").read_text())
+    cfg = json.loads((ROOT / "output" / out_dir / "model_config.json").read_text())
     m = UNet(n_in=cfg["n_in"], n_out=cfg["n_out"], base=cfg["base"], dropout=dropout)
-    sd = torch.load(ROOT / out_dir / "best_model.pt", map_location=device, weights_only=True)
+    sd = torch.load(ROOT / "output" / out_dir / "best_model.pt", map_location=device, weights_only=True)
     m.load_state_dict(sd)
     m.eval()
-    norm = Normalizer.load(ROOT / out_dir / "normalizer.npz")
+    norm = Normalizer.load(ROOT / "output" / out_dir / "normalizer.npz")
     return m, norm
 
 
@@ -209,7 +209,7 @@ with torch.no_grad():
 # 5. Manifest
 # ----------------------------------------------------------------------------
 def test_scores(out_dir):
-    p = ROOT / out_dir / "r2_scores_test.json"
+    p = ROOT / "output" / out_dir / "r2_scores_test.json"
     return json.loads(p.read_text()) if p.exists() else {}
 
 manifest = {

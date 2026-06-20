@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N eval_oro_coastal
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB:gpu_type=a100
+#PBS -l walltime=00:30:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/eval_oro_coastal.log
+#PBS -j oe
+
+set -euo pipefail
+echo "started $(date) on $(hostname)"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+python -u scripts/eval_oro_coastal.py
+echo "done $(date)"

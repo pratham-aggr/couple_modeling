@@ -126,7 +126,7 @@ class MmapValDataset(torch.utils.data.Dataset):
 def load_val_data(exp):
     """Return a streaming val dataset — no full-dataset copy in RAM."""
     cache_dir = Path("/glade/work/praggarwal") / exp["cache"]
-    out_dir   = COUPLE_DIR / exp["out_dir"]
+    out_dir   = COUPLE_DIR / "output" / exp["out_dir"]
 
     X_mm    = np.load(cache_dir / "X.npy",    mmap_mode="r")
     Y_mm    = np.load(cache_dir / "Y.npy",    mmap_mode="r")
@@ -159,7 +159,7 @@ def load_val_data(exp):
 
 def run_inference(exp):
     """Return (truth_mean, pred_mean, bias_mean) each (n_out, H, W), NaN over land."""
-    out_dir = COUPLE_DIR / exp["out_dir"]
+    out_dir = COUPLE_DIR / "output" / exp["out_dir"]
     val_ds, norm, tgt_vars, cfg = load_val_data(exp)
 
     model = UNet(n_in=cfg["n_in"], n_out=cfg["n_out"], base=cfg["base"]).to(DEVICE)
@@ -214,7 +214,7 @@ def plot_r2_summary():
     print("Building R² summary chart ...")
     r2_data = {}
     for exp in EXPERIMENTS:
-        out_dir = COUPLE_DIR / exp["out_dir"]
+        out_dir = COUPLE_DIR / "output" / exp["out_dir"]
         r2_path = out_dir / "r2_scores.json"
         if not r2_path.exists():
             print(f"  Skipping {exp['label']} — no r2_scores.json")
@@ -283,7 +283,7 @@ def plot_r2_summary():
 # ---------------------------------------------------------------------------
 def plot_val_maps(exp_label="lag=0h"):
     exp = next(e for e in EXPERIMENTS if e["label"] == exp_label)
-    out_dir = COUPLE_DIR / exp["out_dir"]
+    out_dir = COUPLE_DIR / "output" / exp["out_dir"]
     if not (out_dir / "best_model.pt").exists():
         print(f"Skipping {exp_label} — no best_model.pt")
         return
@@ -357,7 +357,7 @@ def _collect_all_inference():
     results  = {}
     tgt_vars = None
     for exp in EXPERIMENTS:
-        out_dir = COUPLE_DIR / exp["out_dir"]
+        out_dir = COUPLE_DIR / "output" / exp["out_dir"]
         if not (out_dir / "best_model.pt").exists():
             print(f"  Skipping {exp['label']} — no model")
             continue
@@ -372,7 +372,7 @@ def _collect_all_inference():
 def _load_r2_all():
     r2_all = {}
     for exp in EXPERIMENTS:
-        p = COUPLE_DIR / exp["out_dir"] / "r2_scores.json"
+        p = COUPLE_DIR / "output" / exp["out_dir"] / "r2_scores.json"
         if p.exists():
             r2_all[exp["label"]] = json.load(open(p))
     return r2_all

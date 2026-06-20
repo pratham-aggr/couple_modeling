@@ -4,8 +4,8 @@
 #PBS -q nvgpu
 #PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
 #PBS -l walltime=01:00:00
-#PBS -o /glade/u/home/praggarwal/couple/eval_mem24h_dsst_temporal_combo.log
-#PBS -e /glade/u/home/praggarwal/couple/eval_mem24h_dsst_temporal_combo.err
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/eval_mem24h_dsst_temporal_combo.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/eval_mem24h_dsst_temporal_combo.err
 #PBS -j oe
 
 COUPLE_DIR=/glade/u/home/praggarwal/couple
@@ -23,7 +23,7 @@ cd ${COUPLE_DIR}
 echo "Eval-only test R2 for combo run at $(date)"
 python -u train_unet.py \
     --zarr_glob     "${ZARR_GLOB}" \
-    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_dsst_temporal_combo \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_combo \
     --subsample     1.0 \
     --memory \
     --batch         8 \

@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N eval_baseline_metrics
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=8:ngpus=1:mem=235GB:gpu_type=a100
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/eval_baseline_metrics.log
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "started $(date) on $(hostname)"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+# Regenerate test metrics (R2 + RMSE + corr) for the existing flux-only MSE
+# baseline vfcg1m61 from its best_model.pt — writes metrics_test.json.
+python -u train_unet.py \
+    --zarr_glob   "${ZARR_GLOB}" \
+    --out_dir     ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_radprecip \
+    --subsample   1.0 \
+    --memory --dsst_dt --with_rad --with_precip \
+    --split_mode  temporal --test_years 2013 2014 \
+    --base 64 --batch 8 \
+    --eval_test
+
+echo "done $(date)"

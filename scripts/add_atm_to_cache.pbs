@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -N add_atm_cache
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l walltime=04:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/add_atm_to_cache.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/add_atm_to_cache.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "Building Y_atm.npy at $(date)"
+python -u add_atm_to_cache.py \
+    --cache_dir /glade/work/praggarwal/couple_cache_mem24h
+
+echo "Done at $(date)"

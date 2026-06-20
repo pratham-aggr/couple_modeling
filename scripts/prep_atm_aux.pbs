@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N prep_atm_aux
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -l walltime=04:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/prep_atm_aux.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/prep_atm_aux.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+CACHE=/glade/work/praggarwal/couple_cache_mem24h
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "Job started: $(date), node=$(hostname)"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+# 1. Build Y_atm.npy (Ubot,Vbot,Tbot,Qbot,PS at t-1) if not already present.
+if [ ! -f "${CACHE}/Y_atm.npy" ]; then
+    echo "Building Y_atm.npy ..."
+    python -u add_atm_to_cache.py --cache_dir ${CACHE} --zarr_glob "${ZARR_GLOB}"
+else
+    echo "Y_atm.npy already exists — skipping cache build."
+fi
+
+# 2. Precompute the 13-channel normaliser for the EXPERIMENT run.
+echo "Precomputing 13-channel normaliser (flux+rad+precip+atm) ..."
+python -u precompute_norm.py \
+    --cache_dir      ${CACHE} \
+    --out_dir        ${COUPLE_DIR}/output/output_unet_mem24h_atm_aux \
+    --zarr_glob      "${ZARR_GLOB}" \
+    --train_end_year 2010 \
+    --mem_channels   0 1 2 3 4 \
+    --dsst_dt --with_rad --with_precip --with_atm
+
+# 3. Precompute the 8-channel normaliser for the matched BASELINE run.
+echo "Precomputing 8-channel normaliser (flux+rad+precip) ..."
+python -u precompute_norm.py \
+    --cache_dir      ${CACHE} \
+    --out_dir        ${COUPLE_DIR}/output/output_unet_mem24h_mse_baseline \
+    --zarr_glob      "${ZARR_GLOB}" \
+    --train_end_year 2010 \
+    --mem_channels   0 1 2 3 4 \
+    --dsst_dt --with_rad --with_precip
+
+echo "Done at $(date)"

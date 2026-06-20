@@ -4,8 +4,8 @@
 #PBS -q nvgpu
 #PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
 #PBS -l walltime=24:00:00
-#PBS -o /glade/u/home/praggarwal/couple/unet_mem24h_dsst_cosine.log
-#PBS -e /glade/u/home/praggarwal/couple/unet_mem24h_dsst_cosine.err
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_cosine.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_dsst_cosine.err
 #PBS -j oe
 
 COUPLE_DIR=/glade/u/home/praggarwal/couple
@@ -22,7 +22,7 @@ cd ${COUPLE_DIR}
 echo "Resuming mem24h + dSST/dt + cosine scheduler at $(date)"
 python -u train_unet.py \
     --zarr_glob     "${ZARR_GLOB}" \
-    --out_dir       ${COUPLE_DIR}/output_unet_mem24h_dsst_cosine \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_dsst_cosine \
     --subsample     1.0 \
     --memory \
     --max_epochs    500 \

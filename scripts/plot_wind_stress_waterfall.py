@@ -31,7 +31,7 @@ BASE_ALPHA  = 0.25
 
 
 def load_r2(out_dir):
-    p = ROOT / out_dir / "r2_scores_test.json"
+    p = ROOT / "output" / out_dir / "r2_scores_test.json"
     return json.loads(p.read_text())
 
 

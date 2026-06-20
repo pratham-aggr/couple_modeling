@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -N add_rad_to_cache
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=03:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/add_rad_to_cache.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/add_rad_to_cache.err
+#PBS -j oe
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+set -euo pipefail
+echo "Job started: $(date), node=$(hostname)"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "Appending FSDS_J / FLDS_J (J/m2) to mem24h cache as Y_rad.npy ..."
+python -u add_rad_to_cache.py \
+    --cache_dir /glade/work/praggarwal/couple_cache_mem24h \
+    --zarr_glob "${ZARR_GLOB}"
+
+echo "Done at $(date)"
