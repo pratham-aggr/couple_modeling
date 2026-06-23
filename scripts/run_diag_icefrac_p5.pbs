@@ -1,0 +1,14 @@
+#!/bin/bash
+#PBS -N diag_icefrac_p5
+#PBS -A ucsd0044
+#PBS -q casper
+#PBS -l select=1:ncpus=4:ngpus=1:mem=32GB:gpu_type=a100
+#PBS -l walltime=01:30:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/diag_icefrac_p5.log
+#PBS -j oe
+
+set -euo pipefail
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+python -u scripts/diag_icefrac_p5.py

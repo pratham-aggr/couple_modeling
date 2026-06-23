@@ -930,6 +930,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="AdamW/Muon weight decay (default 1e-4 — the previous "
                              "hardcoded value, so old runs are unchanged).")
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="Max global grad-norm (clip_grad_norm_). 0 = off (default, "
+                             "old runs reproduce identically). Recommended ~1.0 for the "
+                             "CRPS fine-tuning stage to prevent divergence.")
     parser.add_argument("--val_split_mode", choices=["random", "temporal"], default="random",
                         help="Val split: random (default, seed-42 permutation) or temporal "
                              "(hold out last 10%% by cache position as time proxy). "
@@ -1518,6 +1522,8 @@ def main():
                 loss = masked_mse(model(x_n), y_n, mask, lat_w=lat_w, var_w=var_w)
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             if muon_opt is not None:
                 muon_opt.step()

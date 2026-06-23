@@ -1,11 +1,11 @@
 #!/bin/bash
-#PBS -N unet_ucast_s2
+#PBS -N unet_ucast_s2_resume
 #PBS -A ucsd0044
 #PBS -q nvgpu
 #PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
 #PBS -l walltime=08:00:00
-#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2.log
-#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2.err
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2_resume.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/unet_ucast_s2_resume.err
 #PBS -j oe
 
 # U-Cast Stage 2: probabilistic CRPS fine-tuning with MC Dropout + AdamW + EMA.
@@ -44,7 +44,7 @@ python -u train_unet.py \
     --optimizer     adamw \
     --lr            1e-4 \
     --grad_clip     1.0 \
-    --resume_weights_only \
+    --resume \
     --ema \
     --eval_prob \
     --eval_members  8 \
@@ -54,7 +54,7 @@ python -u train_unet.py \
     --base          64 \
     --scheduler     cosine \
     --split_mode    temporal \
-    --wandb_name    mem24h-radprecip-ucast-s2-crps-adamw \
+    --wandb_name    mem24h-radprecip-ucast-s2-crps-adamw-resume \
     --wandb_project couple-unet
 
 echo "U-Cast Stage 2 done at $(date)"
