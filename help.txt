@@ -1,0 +1,2 @@
+# Resume gx1v7 training after walltime kill
+qsub scripts/submit_train_gx1v7.pbs

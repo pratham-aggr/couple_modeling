@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -N remap_gx1v7
+#PBS -A UCSD0085
+#PBS -q main@casper-pbs
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/remap_gx1v7.log
+
+set -euo pipefail
+echo "Job started: $(date), host=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+OUT_DIR="/glade/derecho/scratch/praggarwal/zarr_gx1v7"
+
+python /glade/u/home/praggarwal/couple/remap_zarr_gx1v7.py \
+    --zarr_glob "${ZARR_GLOB}" \
+    --out_dir   "${OUT_DIR}"
+
+echo "Done: $(date)"
+echo "Output zarr files:"
+ls "${OUT_DIR}/"

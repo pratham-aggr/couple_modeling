@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -N unet_gx1v7
+#PBS -A ucsd0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=235GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_gx1v7.log
+
+# Train MEMO on native gx1v7 (320x384) grid to test whether eliminating the
+# inference remap improves flux quality.  Same hyperparameters as the MSE
+# radprecip baseline so R² comparison isolates the grid effect.
+#
+# Prereq: submit_remap_gx1v7.pbs must have completed and zarr files must exist
+#         in /glade/derecho/scratch/praggarwal/zarr_gx1v7/
+
+set -euo pipefail
+echo "Job started: $(date), host=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+# Verify zarr files exist before launching
+n=$(find /glade/derecho/scratch/praggarwal/zarr_gx1v7/ -maxdepth 1 -name "*.zarr" -type d 2>/dev/null | wc -l)
+echo "Found ${n} gx1v7 zarr stores"
+if [ "${n}" -lt 30 ]; then
+    echo "ERROR: expected >=30 zarr files, got ${n}. Run submit_remap_gx1v7.pbs first."
+    exit 1
+fi
+
+cd ${COUPLE_DIR}
+
+CACHE_DIR="/glade/work/praggarwal/couple_cache_gx1v7_mem24h"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7 \
+    --cache_dir     "${CACHE_DIR}" \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --wandb_name    mem24h-gx1v7 \
+    --wandb_project couple-unet \
+    --resume
+
+echo "Done: $(date)"

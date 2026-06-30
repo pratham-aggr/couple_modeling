@@ -1,0 +1,2 @@
+
+  qsub /glade/u/home/praggarwal/couple/scripts/submit_train_gx1v7.pbs

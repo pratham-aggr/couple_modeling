@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -N train_hpx64
+#PBS -A UCSD0085
+#PBS -q casper
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/train_hpx64.log
+#PBS -j oe
+
+set -euo pipefail
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+
+CACHE=/glade/work/praggarwal/couple_cache_hpx64
+OUT=output/output_hpx64_mem24h
+ZGLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+
+echo "=== precompute_norm_hpx (train-only stats) ==="
+python -u precompute_norm_hpx.py --cache_dir $CACHE --out_dir $OUT \
+    --zarr_glob "$ZGLOB" --train_end_year 2010 --mem_channels 0 1 2 3 4 \
+    --dsst_dt --with_rad --with_precip
+
+echo "=== train_hpx ==="
+python -u train_hpx.py --cache_dir $CACHE --out_dir $OUT --zarr_glob "$ZGLOB" \
+    --nside 64 --base 64 --batch 8 --dropout 0.1 --dsst_dt --with_rad --with_precip \
+    --num_workers 8 --max_epochs 500 --patience 40 \
+    --wandb_project couple-unet --wandb_name hpx64-mem24h-dsst-radprecip-do0.1

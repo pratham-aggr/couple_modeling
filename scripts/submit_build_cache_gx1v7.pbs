@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N build_cache_gx1v7
+#PBS -A UCSD0085
+#PBS -q main@casper-pbs
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/build_cache_gx1v7.log
+
+set -euo pipefail
+echo "Job started: $(date), host=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+python -u /glade/u/home/praggarwal/couple/build_cache_gx1v7.py
+
+echo "Done: $(date)"
+echo "Cache contents:"
+ls -lh /glade/work/praggarwal/couple_cache_gx1v7_mem24h/

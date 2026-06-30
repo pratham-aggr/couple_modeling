@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N smoke_hpx
+#PBS -A UCSD0085
+#PBS -q casper
+#PBS -l select=1:ncpus=8:ngpus=1:mem=80GB:gpu_type=a100
+#PBS -l walltime=00:25:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/smoke_hpx_compile.log
+#PBS -j oe
+set -euo pipefail
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+export PYTHONWARNINGS=ignore
+CACHE=/glade/work/praggarwal/couple_cache_hpx64
+OUT=/glade/derecho/scratch/praggarwal/tmp/claude-50400/-glade-u-home-praggarwal-couple/ffe8f0c2-7a5d-4059-bd1b-f19f1ac2c068/scratchpad/smoke_out
+mkdir -p $OUT
+cp output/output_hpx64_mem24h/normalizer.npz $OUT/
+ZGLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+echo "=== smoke: train_hpx with torch.compile, 3 steps x 2 epochs + test eval ==="
+python -u train_hpx.py --cache_dir $CACHE --out_dir $OUT --zarr_glob "$ZGLOB" \
+    --nside 64 --base 64 --batch 8 --dropout 0.1 --dsst_dt --with_rad --with_precip \
+    --num_workers 8 --max_epochs 500 --patience 40 --max_steps_dryrun 3
+echo "=== smoke metrics ==="; cat $OUT/metrics_test.json

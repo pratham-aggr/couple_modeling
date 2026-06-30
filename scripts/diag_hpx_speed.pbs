@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N diag_hpx_speed
+#PBS -A UCSD0085
+#PBS -q casper
+#PBS -l select=1:ncpus=16:ngpus=1:mem=80GB:gpu_type=a100
+#PBS -l walltime=00:25:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/diag_hpx_speed.log
+#PBS -j oe
+
+set -euo pipefail
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+export PYTHONWARNINGS=ignore
+python -u scripts/diag_hpx_speed.py
