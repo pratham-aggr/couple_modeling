@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N train_cice
+#PBS -A UCSD0085
+#PBS -q casper
+#PBS -l select=1:ncpus=16:ngpus=1:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/train_cice.log
+#PBS -j oe
+
+# Train the CICE sea-ice emulator (gx1v7 UNet 7->6) on the monthly cache.
+set -euo pipefail
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd /glade/u/home/praggarwal/couple
+
+CACHE=/glade/derecho/scratch/praggarwal/couple_cache_cice
+OUT=output/output_cice_v1
+
+echo "=== train_cice ==="
+python -u train_cice.py --cache_dir "$CACHE" --out_dir "$OUT" \
+    --epochs 80 --batch 8 --lr 2e-4 --base 64 --dropout 0.1 --augment
