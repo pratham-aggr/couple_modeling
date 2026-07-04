@@ -175,66 +175,6 @@ class PairDataset(Dataset):
                 torch.from_numpy(np.ascontiguousarray(m)))
 
 
-class CacheMmapDataset(Dataset):
-    """Dataset backed by numpy memmaps. Reads one sample at a time — no bulk list building.
-
-    Accepts the Y arrays split across multiple memmaps (Y_mm for core fluxes,
-    Yr_mm for radiation, Yp_mm for precip, Ya_mm for aux-atm) and concatenates
-    them per sample in __getitem__, keeping peak RAM to O(one sample).
-    """
-
-    def __init__(self, X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm, mask_mm,
-                 indices, norm: Normalizer, mem_channels,
-                 dsst_dt=False, augment=False, co2_mm=None, statics=None):
-        self.X_mm    = X_mm
-        self.Y_mm    = Y_mm
-        self.Yr_mm   = Yr_mm     # (N, 2, H, W) or None
-        self.Yp_mm   = Yp_mm     # (N, 1, H, W) or None
-        self.Ya_mm   = Ya_mm     # (N, 5, H, W) or None
-        self.mask_mm = mask_mm
-        self.indices = np.asarray(indices)
-        self.norm    = norm
-        self.mem_ch  = mem_channels
-        self.dsst_dt = dsst_dt
-        self.augment = augment
-        self.co2_mm  = co2_mm
-        self.statics = statics
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        i = int(self.indices[idx])
-        raw = self.X_mm[i]                        # (6, H, W) float32
-        x = raw[self.mem_ch].copy()               # (C_in, H, W)
-        if self.dsst_dt:
-            dsst = ((raw[0] - raw[3]) / 86400.0)[None]
-            x = np.concatenate([x, dsst], axis=0)
-        if self.co2_mm is not None:
-            H, W = x.shape[1], x.shape[2]
-            x = np.concatenate(
-                [x, np.full((1, H, W), float(self.co2_mm[i]), dtype=np.float32)], axis=0)
-        if self.statics is not None:
-            x = np.concatenate([x, self.statics], axis=0)
-        y_parts = [self.Y_mm[i]]
-        if self.Yr_mm is not None: y_parts.append(self.Yr_mm[i])
-        if self.Yp_mm is not None: y_parts.append(self.Yp_mm[i])
-        if self.Ya_mm is not None: y_parts.append(self.Ya_mm[i])
-        y = np.concatenate(y_parts, axis=0) if len(y_parts) > 1 else y_parts[0].copy()
-        m = self.mask_mm[i].copy()
-        x_n = (x - self.norm.x_mean[:, None, None]) / (self.norm.x_std[:, None, None] + 1e-8)
-        y_n = (y - self.norm.y_mean[:, None, None]) / (self.norm.y_std[:, None, None] + 1e-8)
-        if self.augment:
-            s = int(np.random.randint(0, x_n.shape[-1]))
-            if s:
-                x_n = np.roll(x_n, s, axis=-1)
-                y_n = np.roll(y_n, s, axis=-1)
-                m   = np.roll(m,   s, axis=-1)
-        return (torch.from_numpy(np.ascontiguousarray(x_n.astype(np.float32))),
-                torch.from_numpy(np.ascontiguousarray(y_n.astype(np.float32))),
-                torch.from_numpy(np.ascontiguousarray(m.astype(np.float32))))
-
-
 # ---------------------------------------------------------------------------
 # UNet adapted from climatebench/src/models/unet_simple.py
 #
@@ -443,54 +383,6 @@ def compute_norm(X_list, Y_list) -> Normalizer:
 
     xm, xs = stats(X_all)
     ym, ys = stats(Y_all)
-    return Normalizer(xm, xs, ym, ys)
-
-
-def compute_norm_from_mmap(X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm,
-                            train_idx, mem_channels, dsst_dt,
-                            co2_mm=None, statics=None,
-                            H=None, W=None, chunk=256) -> Normalizer:
-    """Chunked normaliser from memmaps. No np.stack — peak RAM is O(chunk samples)."""
-    if H is None: H = X_mm.shape[2]
-    if W is None: W = X_mm.shape[3]
-    C_x = len(mem_channels) + (1 if dsst_dt else 0)
-    if co2_mm is not None: C_x += 1
-    if statics is not None: C_x += statics.shape[0]
-    C_y = Y_mm.shape[1]
-    if Yr_mm is not None: C_y += Yr_mm.shape[1]
-    if Yp_mm is not None: C_y += Yp_mm.shape[1]
-    if Ya_mm is not None: C_y += Ya_mm.shape[1]
-
-    s1x = np.zeros(C_x, np.float64); s2x = np.zeros(C_x, np.float64)
-    s1y = np.zeros(C_y, np.float64); s2y = np.zeros(C_y, np.float64)
-    npts = 0
-    for start in range(0, len(train_idx), chunk):
-        bi = train_idx[start:start+chunk]
-        raw = X_mm[bi].astype(np.float64)          # (b, 6, H, W)
-        x = raw[:, mem_channels]
-        if dsst_dt:
-            dsst = ((raw[:, 0] - raw[:, 3]) / 86400.0)[:, None]
-            x = np.concatenate([x, dsst], axis=1)
-        if co2_mm is not None:
-            cv = co2_mm[bi].astype(np.float64)[:, None, None, None]
-            x = np.concatenate([x, np.broadcast_to(cv, (len(bi), 1, H, W))], axis=1)
-        if statics is not None:
-            st = np.broadcast_to(statics[None].astype(np.float64), (len(bi),) + statics.shape)
-            x = np.concatenate([x, st], axis=1)
-        y_parts = [Y_mm[bi].astype(np.float64)]
-        if Yr_mm is not None: y_parts.append(Yr_mm[bi].astype(np.float64))
-        if Yp_mm is not None: y_parts.append(Yp_mm[bi].astype(np.float64))
-        if Ya_mm is not None: y_parts.append(Ya_mm[bi].astype(np.float64))
-        y = np.concatenate(y_parts, axis=1) if len(y_parts) > 1 else y_parts[0]
-        s1x += x.sum(axis=(0, 2, 3)); s2x += (x**2).sum(axis=(0, 2, 3))
-        s1y += y.sum(axis=(0, 2, 3)); s2y += (y**2).sum(axis=(0, 2, 3))
-        npts += len(bi) * H * W
-        if (start // chunk) % 50 == 0:
-            print(f"    norm chunk {start+len(bi)}/{len(train_idx)} ...")
-    xm = (s1x/npts).astype(np.float32)
-    xs = np.sqrt(np.maximum(s2x/npts - (s1x/npts)**2, 0)).astype(np.float32)
-    ym = (s1y/npts).astype(np.float32)
-    ys = np.sqrt(np.maximum(s2y/npts - (s1y/npts)**2, 0)).astype(np.float32)
     return Normalizer(xm, xs, ym, ys)
 
 
@@ -1084,13 +976,7 @@ def main():
                              "checkpoint.pt, skipping optimizer/scheduler state. Lets Stage 2 "
                              "switch optimizer (e.g. to Muon) without a param-group mismatch. "
                              "Default off.")
-    parser.add_argument("--grid_shape", type=int, nargs=2, default=[192, 288],
-                        metavar=("H", "W"),
-                        help="Spatial grid dimensions (default 192 288). Use 320 384 for "
-                             "native gx1v7 ocean grid training.")
     args = parser.parse_args()
-    global H, W
-    H, W = args.grid_shape
 
     if args.dsst_dt and not args.memory:
         print("WARNING: --dsst_dt ignored (only meaningful with --memory)")
@@ -1254,8 +1140,26 @@ def main():
         if args.statics:
             statics = load_statics(args.statics_file, args.statics_vars, H, W)
             print(f"  Static channels enabled: {args.statics_vars}  shape={statics.shape}")
-        # Skip building Python lists — use memmaps directly to avoid OOM on large grids.
-        print(f"  Memmap-backed: {len(chosen)} / {N_full} samples (no list build, {time_module.time()-t0:.1f}s)")
+        X_all = []
+        for i in chosen:
+            x = X_np[i][mem_channels] if args.memory else X_np[i]
+            if args.dsst_dt:
+                # SST[t]=ch0, SST_prev=ch3 in the raw 6-channel memory cache
+                dsst = ((X_np[i][0] - X_np[i][3]) / 86400.0)[None]   # (1, H, W)
+                x = np.concatenate([x, dsst], axis=0)
+            if args.with_co2:
+                x = np.concatenate([x, np.full((1, H, W), co2_np[i], dtype=np.float32)], axis=0)
+            if statics is not None:
+                x = np.concatenate([x, statics], axis=0)   # appended last (constant in time)
+            X_all.append(x.copy())
+        _extra_y = [e for e in (yrad_np, yprecip_np, yatm_np) if e is not None]
+        if _extra_y:
+            Y_all = [np.concatenate([Y_np[i]] + [e[i] for e in _extra_y], axis=0).copy()
+                     for i in chosen]
+        else:
+            Y_all = [Y_np[i].copy()    for i in chosen]
+        mask_all = [mask_np[i].copy() for i in chosen]
+        print(f"  Loaded {len(X_all)} / {N_full} samples in {time_module.time()-t0:.1f}s")
     else:
         if args.statics:
             raise NotImplementedError(
@@ -1276,7 +1180,7 @@ def main():
                       f"{len(X_all):5d} samples  "
                       f"{time_module.time()-t0:.0f}s")
 
-    print(f"\nTotal samples: {len(chosen) if cache_ok else len(X_all)}")
+    print(f"\nTotal samples: {len(X_all)}")
 
     # Build year label for every sample in X_all (used for year-based splits)
     _mem_lag_steps = (args.memory_lag // 6) if args.memory else 0
@@ -1321,15 +1225,8 @@ def main():
         print(f"Loading pre-computed training-only normaliser from {precomp_norm} ...")
         norm = Normalizer.load(precomp_norm)
     elif args.split_mode == "temporal":
-        if cache_ok:
-            print("Computing normalisation stats from training samples (chunked memmap) ...")
-            norm = compute_norm_from_mmap(
-                X_np, Y_np, yrad_np, yprecip_np, yatm_np,
-                chosen[ti], mem_channels, args.dsst_dt,
-                co2_mm=co2_np, statics=statics, H=H, W=W, chunk=256)
-        else:
-            print("Computing normalisation stats from training samples ...")
-            norm = compute_norm([X_all[k] for k in ti], [Y_all[k] for k in ti])
+        print("Computing normalisation stats from training samples ...")
+        norm = compute_norm([X_all[k] for k in ti], [Y_all[k] for k in ti])
         norm.save(precomp_norm)
     else:
         pass  # fall through to cache-based block below
@@ -1346,15 +1243,7 @@ def main():
             norm = norm_full
         if args.dsst_dt:
             dsst_ch  = len(mem_channels)
-            if cache_ok:
-                dsst_parts = []
-                for _s in range(0, len(ti), 512):
-                    _bi = chosen[ti[_s:_s+512]]
-                    _raw = X_np[_bi].astype(np.float64)
-                    dsst_parts.append(((_raw[:, 0] - _raw[:, 3]) / 86400.0).ravel())
-                dsst_arr = np.concatenate(dsst_parts)
-            else:
-                dsst_arr = np.stack([X_all[k][dsst_ch] for k in ti]).astype(np.float64)
+            dsst_arr = np.stack([X_all[k][dsst_ch] for k in ti]).astype(np.float64)
             dsst_mean = np.array([dsst_arr.mean()],             dtype=np.float32)
             dsst_std  = np.array([max(dsst_arr.std(), 1e-8)],   dtype=np.float32)
             norm = Normalizer(
@@ -1400,10 +1289,6 @@ def main():
     Y_all_raw_vi = None  # raw val Y for R² (only used when --anomaly)
     months_vi   = None
 
-    if args.anomaly and cache_ok:
-        raise NotImplementedError(
-            "--anomaly is not supported with the memmap cache path. "
-            "Use the zarr path (no --cache_dir) or implement anomaly support for memmaps.")
     if args.anomaly:
         print("\nComputing monthly climatology for anomaly prediction ...")
         months_chosen = _load_months(zarr_paths, chosen,
@@ -1442,18 +1327,10 @@ def main():
 
         clim_torch = torch.from_numpy(clim).to(device)
 
-    if cache_ok:
-        _mm_kwargs = dict(norm=norm, mem_channels=mem_channels, dsst_dt=args.dsst_dt,
-                          co2_mm=co2_np, statics=statics)
-        trn_ds = CacheMmapDataset(X_np, Y_np, yrad_np, yprecip_np, yatm_np, mask_np,
-                                   chosen[ti], augment=args.augment, **_mm_kwargs)
-        val_ds = CacheMmapDataset(X_np, Y_np, yrad_np, yprecip_np, yatm_np, mask_np,
-                                   chosen[vi], augment=False, **_mm_kwargs)
-    else:
-        trn_ds = PairDataset([X_all[i] for i in ti], [Y_all[i] for i in ti],
-                             [mask_all[i] for i in ti], norm, augment=args.augment)
-        val_ds = PairDataset([X_all[i] for i in vi], [Y_all[i] for i in vi],
-                             [mask_all[i] for i in vi], norm)
+    trn_ds = PairDataset([X_all[i] for i in ti], [Y_all[i] for i in ti],
+                         [mask_all[i] for i in ti], norm, augment=args.augment)
+    val_ds = PairDataset([X_all[i] for i in vi], [Y_all[i] for i in vi],
+                         [mask_all[i] for i in vi], norm)
 
     trn_loader = DataLoader(trn_ds, batch_size=args.batch, shuffle=True,
                             num_workers=4, pin_memory=True)
@@ -1462,12 +1339,8 @@ def main():
 
     test_loader = None
     if len(test_idx) > 0:
-        if cache_ok:
-            test_ds = CacheMmapDataset(X_np, Y_np, yrad_np, yprecip_np, yatm_np, mask_np,
-                                        chosen[test_idx], augment=False, **_mm_kwargs)
-        else:
-            test_ds = PairDataset([X_all[i] for i in test_idx], [Y_all[i] for i in test_idx],
-                                  [mask_all[i] for i in test_idx], norm)
+        test_ds = PairDataset([X_all[i] for i in test_idx], [Y_all[i] for i in test_idx],
+                              [mask_all[i] for i in test_idx], norm)
         test_loader = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
                                  num_workers=4, pin_memory=True)
 

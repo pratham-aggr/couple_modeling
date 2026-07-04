@@ -1,7 +1,7 @@
 # MEMO–POP Blowup Diagnosis
 
-**Date:** 2026-06-23  
-**Status:** Root cause identified; two distinct failure modes confirmed across MSE and CRPS models
+**Date:** 2026-06-22  
+**Status:** Root cause identified; fix direction clear
 
 ---
 
@@ -11,35 +11,17 @@ Our coupled MEMO→POP simulation kept crashing at high-latitude Southern Ocean 
 
 ---
 
-## Coupling Experiments Run
+## Symptom
 
-All runs start from the CESM2-LE 1980-01-01 ocean restart. Crash location is always the Antarctic shelf (Ross/Amundsen Sea, ~60°S). Two distinct failure modes were identified across experiments:
+Each run was healthy for months, then exploded within hours at a deep-convection cell on the Antarctic shelf (Ross/Amundsen Sea, ~60°S). The explosion was always sub-daily — no daily warning — which pointed to numerical instability, not a slow physical drift.
 
-- **TLT abort** — `hmix_gm.F90:3393` (`Incorrect TLT computations`): KPP boundary-layer depth (HBLT) goes NaN under abrupt or strong fluxes on the first ocean step, propagating into the GM transition-layer solver. Fires fast (within days) when fluxes are applied at full strength from the start.
-- **Tracer-CFL blowup** — vertical advection Courant number exceeds 1 at steep shelf cells. SST spikes from ~33°C to >45°C in a single timestep. Fires slower (weeks to months) as SST anomalies accumulate where MEMO under-damps.
+| Configuration | Crash day |
+|---|---|
+| Baseline | 7 |
+| + flux ramping | 133 |
+| + smaller timestep | 225 |
 
-### MSE model (`output_unet_mem24h_dsst_temporal_radprecip`)
-
-| Configuration | Crash day | Failure mode |
-|---|---|---|
-| No damping | 7 | TLT abort (`hmix_gm:3393`) |
-| + flux ramp (0→1 over 10 d) | 133 | Tracer-CFL blowup |
-| + flux ramp + smaller timestep | 225 | Tracer-CFL blowup |
-
-Flux ramp delays the TLT abort by softening the initial flux shock, but then a slower thermal blowup takes over — because MEMO's heat flux damping is only ~0.4–5% of the physical truth, SST anomalies at shelf cells grow until POP's vertical numerics fail.
-
-### CRPS model (`output_unet_mem24h_dsst_temporal_radprecip_ucast`, run p5ge0uvh)
-
-| Configuration | Crash day | Failure mode |
-|---|---|---|
-| No damping | ~8 | TLT abort (`hmix_gm:3393`) |
-| + flux ramp + tau cap (τ < 0.5 N/m²) | ~15 | Tracer-CFL blowup (SST 33→46°C at step 59) |
-
-Same two failure modes as MSE. The CRPS model crashes *earlier* than the equivalently damped MSE run (day 15 vs 133), despite being trained with a probabilistic loss that should produce sharper, more physically realistic flux distributions. The wind-stress cap fired on 1600–3700 cells per step in the damped CRPS run; zero cells in the undamped run before the TLT abort, suggesting the CRPS model produces lower peak stress but still under-damps heat fluxes enough for the thermal blowup to develop.
-
-### Summary
-
-Neither model architecture nor loss function (MSE vs CRPS) prevents the crash. Both models share the same root deficiency — missing wind speed and boundary-layer air temperature as inputs — which causes ~20–250× under-damping of turbulent heat fluxes regardless of how the model is trained.
+Each fix delayed the crash, none cured it. That pattern means a systematic mechanism — not a one-off bad cell — is driving it.
 
 ---
 
