@@ -45,12 +45,20 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from solar import daily_insolation, representative_doy_from_stamp
+
 ICE_ROOT = "/glade/campaign/cesm/collections/CESM2-LE/ice/proc/tseries/month_1"
 OCN_ROOT = "/glade/campaign/cesm/collections/CESM2-LE/ocn/proc/tseries/month_1"
 
 # ice-side fields (all on gx1v7, nj=384 x ni=320)
 ICE_TARGETS = ["aice", "hi", "uvel", "vvel", "strocnx", "strocny"]
-ICE_FORCING = ["uatm", "vatm"]           # atmospheric drivers carried in ice tseries
+# uatm/vatm are the 10m winds; they are the natural ice drivers, but the standalone
+# MEMO->POP forcing file carries NO winds, so the ONLINE-coupled emulator cannot see
+# them.  Default is therefore WIND-FREE (ICE_FORCING empty): the emulator becomes a
+# pure SST + autoregressive-ice-state map, which is exactly the input set available
+# online (POP SST + the emulator's own previous ice output).  Pass --with_winds to
+# restore uatm/vatm (the offline v1 variant).
+ICE_FORCING = []                         # set by --with_winds
 ICE_STATE   = ["aice", "hi", "uvel", "vvel"]  # channels carried back as *_prev memory
 # ocn-side field (input the ice responds to)
 OCN_INPUT   = ["SST"]
@@ -89,6 +97,19 @@ def _mf(root, member, var, year_start, year_end):
     return np.concatenate(vals, 0), np.concatenate(times, 0)
 
 
+def _get_tlat(member):
+    """Read the gx1v7 T-cell latitude (nj,ni, deg) once from an SST tseries file.
+    Used to build the analytic TOA-insolation input channel."""
+    p = sorted(glob.glob(f"{OCN_ROOT}/SST/*{member}*.nc"))[0]
+    with xr.open_dataset(p, decode_timedelta=False) as ds:
+        tlat = ds["TLAT"].values.astype(np.float32)
+    # TLAT carries a _FillValue on ~7200 (land/pole) cells; leaving them NaN would
+    # poison the SOLIN channel and, via the convolutions, spread NaN into ocean
+    # cells -> NaN loss.  Fill non-finite lat with 0 (bounded, finite; these cells
+    # are land and masked out of the loss anyway).
+    return np.where(np.isfinite(tlat), tlat, 0.0).astype(np.float32)
+
+
 def load_member(member, year_start, year_end):
     """Build (X, Y, mask) for one ensemble member.
 
@@ -122,13 +143,25 @@ def load_member(member, year_start, year_end):
     sstf  = fill(sst)
     icef  = {v: fill(ice[v]) for v in ice}
 
+    # analytic TOA-insolation channel (season x latitude), the seasonal freeze/melt
+    # driver SST cannot convey under ice.  Aligned to each stamp's DATA month.
+    tlat = _get_tlat(member)                          # (nj, ni) deg
+    solin = np.empty((T, NJ, NI), np.float32)
+    for k in range(T):
+        doy = representative_doy_from_stamp(tcommon[k])
+        solin[k] = np.nan_to_num(daily_insolation(doy, tlat), nan=0.0).astype(np.float32)
+    # NH-summer sanity: July insolation at high N latitude must exceed January's
+    jul = solin[:, tlat > 60].mean(1)                 # crude seasonal check
+    print(f"    SOLIN high-N range over record: [{jul.min():.0f}, {jul.max():.0f}] W/m2")
+
     now  = slice(MEMORY_LAG_STEPS, T)     # t
     prev = slice(0, T - MEMORY_LAG_STEPS) # t-1
 
     X = np.stack(
-        [sstf[now], icef["uatm"][now], icef["vatm"][now]] +
+        [sstf[now], solin[now]] +                     # SST, SOLIN (both target-month)
+        [icef[v][now] for v in ICE_FORCING] +         # (+ uatm,vatm if --with_winds)
         [icef[v][prev] for v in ICE_STATE],           # aice_prev,hi_prev,uvel_prev,vvel_prev
-        axis=1).astype(np.float32)                    # (N, 7, nj, ni)
+        axis=1).astype(np.float32)                    # (N, n_in, nj, ni)
     Y = np.stack([icef[v][now] for v in ICE_TARGETS], axis=1).astype(np.float32)  # (N,6,nj,ni)
     mask = ocean[now].astype(np.float32)              # (N, nj, ni)
     return X, Y, mask
@@ -141,7 +174,14 @@ def main():
                     help="CESM2-LE member id(s), e.g. LE2-1231.002")
     ap.add_argument("--year_start", type=int, default=1850)
     ap.add_argument("--year_end",   type=int, default=2100)
+    ap.add_argument("--with_winds", action="store_true",
+                    help="include uatm/vatm as inputs (offline v1 variant). "
+                         "Default off -> WIND-FREE emulator for online coupling.")
     args = ap.parse_args()
+
+    global ICE_FORCING
+    if args.with_winds:
+        ICE_FORCING = ["uatm", "vatm"]
 
     cache = Path(args.cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
@@ -157,7 +197,7 @@ def main():
     np.save(cache / "Y.npy", Y)
     np.save(cache / "mask.npy", mask)
 
-    input_vars  = OCN_INPUT + ICE_FORCING + [f"{v}_prev" for v in ICE_STATE]
+    input_vars  = OCN_INPUT + ["SOLIN"] + ICE_FORCING + [f"{v}_prev" for v in ICE_STATE]
     meta = {
         "grid": "gx1v7", "nj": NJ, "ni": NI,
         "members": args.members, "year_start": args.year_start, "year_end": args.year_end,

@@ -15,9 +15,9 @@ module load conda
 conda activate /glade/work/praggarwal/conda-envs/atm
 cd /glade/u/home/praggarwal/couple
 
-CACHE=/glade/derecho/scratch/praggarwal/couple_cache_cice
+CACHE=/glade/derecho/scratch/praggarwal/couple_cache_cice_solin
 
-echo "=== preprocess_cice.py (X, Y, mask, meta) ==="
+echo "=== preprocess_cice.py (X, Y, mask, meta) — WIND-FREE + SOLIN (online-coupling variant) ==="
 python -u preprocess_cice.py --cache_dir "$CACHE" \
     --members LE2-1231.002 --year_start 1850 --year_end 2100
 

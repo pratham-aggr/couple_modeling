@@ -36,7 +36,8 @@ after `rotate_wind_stress`:
 
 - Applied to `SMF` (dyne/cm², U-grid), paired with surface `UVEL/VVEL` (cm/s) — same
   grid-aligned basis. Over the full haloed array, so halos stay consistent.
-- `sdrag = sqrt(rho_air*Cd*|tau|)` is the relative-wind linearization (depends only on
+- `sdrag = sqrt(rho_air*Cd*|tau
+|)` is the relative-wind linearization (depends only on
   |tau| + constants; POP supplies U_ocn locally).
 - Toggle/params (module level): `lcurrent_feedback=.true.`, `rho_air_cfb=1.2e-3` g/cm³,
   `cdrag_cfb=1.5e-3`. Set `lcurrent_feedback=.false.` to revert exactly.
@@ -59,3 +60,7 @@ after `rotate_wind_stress`:
 - `stage_pop_cfb.sh` — clone of `stage_pop_standalone.sh`, own dir/id, `stop_count=1`.
 - `run_pop_cfb_experiment.pbs` — build driver → server → 1-yr POP, isolated.
 - `build_pop_standalone_driver.sh` — unchanged; recompiles the cpl_none driver.
+
+
+ CHANGED overflows_interactive=.false. TO true
+ 

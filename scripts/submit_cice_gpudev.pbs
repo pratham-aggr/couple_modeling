@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N train_cice
+#PBS -A UCSD0085
+#PBS -q gpudev
+#PBS -l select=1:ncpus=16:ngpus=1:mem=200GB
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/train_cice_gpudev.log
+#PBS -j oe
+# Submit via the develop routing queue: qsub -q gpudev@desched1 submit_cice_gpudev.pbs
+#
+# Derecho-gpudev clone of scripts/submit_cice.pbs.  gpudev's develop GPU queue
+# schedules ~immediately (casper nvgpu was Q-waiting for a slot).  Cache is on
+# scratch + atm conda env on /glade/work, both visible from Derecho, so training
+# runs here fine.  Uses ABSOLUTE atm-python (no `module load conda`) to avoid the
+# Casper-module contamination issue on cross-cluster submit.
+set -euo pipefail
+PY=/glade/work/praggarwal/conda-envs/atm/bin/python
+cd /glade/u/home/praggarwal/couple
+
+CACHE=/glade/derecho/scratch/praggarwal/couple_cache_cice_solin
+OUT=output/output_cice_solin
+
+echo "host: $(hostname)  $(date)"
+# --- fast CUDA precheck: abort in seconds if the A100 isn't visible to torch ---
+"$PY" -c "import torch,sys; ok=torch.cuda.is_available(); print('cuda',ok, torch.cuda.get_device_name(0) if ok else ''); sys.exit(0 if ok else 3)"
+
+echo "=== train_cice (WIND-FREE + SOLIN, residual aice/hi -> ice state, for online coupling) ==="
+"$PY" -u train_cice.py --cache_dir "$CACHE" --out_dir "$OUT" \
+    --epochs 80 --batch 8 --lr 2e-4 --base 64 --dropout 0.1 --augment --residual aice,hi
+echo "done: $(date)"

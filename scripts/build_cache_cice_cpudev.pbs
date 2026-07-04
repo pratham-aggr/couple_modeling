@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N build_cache_cice
+#PBS -A UCSD0085
+#PBS -q cpudev
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/build_cache_cice_cpudev.log
+#PBS -j oe
+# Submit via the develop routing queue: qsub -q develop@desched1 build_cache_cice_cpudev.pbs
+#
+# Derecho-cpudev clone of scripts/build_cache_cice.pbs.  campaign IS readable from
+# Derecho compute nodes (verified 2026-07-01, probe on dec2436), so the CESM2-LE
+# tseries read works here and cpudev's develop queue schedules far sooner than
+# casper htc (which was waiting ~2.5 h for a 120GB node).
+#
+# Uses the atm conda env by ABSOLUTE python path (no `module load conda`) to avoid
+# dragging Casper modules onto the Derecho node (see derecho-pbs-V-casper note).
+set -euo pipefail
+PY=/glade/work/praggarwal/conda-envs/atm/bin/python
+cd /glade/u/home/praggarwal/couple
+
+CACHE=/glade/derecho/scratch/praggarwal/couple_cache_cice_solin
+
+echo "host: $(hostname)  $(date)"
+echo "=== preprocess_cice.py (X, Y, mask, meta) — WIND-FREE + SOLIN (online-coupling variant) ==="
+"$PY" -u preprocess_cice.py --cache_dir "$CACHE" \
+    --members LE2-1231.002 --year_start 1850 --year_end 2100
+
+echo "=== done: cache contents ==="
+ls -la "$CACHE"

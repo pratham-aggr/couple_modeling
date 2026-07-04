@@ -36,10 +36,17 @@ from train_unet import UNet, Normalizer, masked_mse, compute_metrics, ModelEMA
 
 class CiceDataset(Dataset):
     """Yields (x_n, y_n, mask) normalised float32 tensors.  Optional circular
-    longitude roll augment (gx1v7 `ni` is periodic), train-split only."""
-    def __init__(self, X, Y, mask, norm, augment=False):
+    longitude roll augment (gx1v7 `ni` is periodic), train-split only.
+
+    res_pairs : list of (out_idx, in_prev_idx).  For those output channels the
+    target is converted to a RESIDUAL y[oc] -= x_raw[ic] BEFORE normalization, so
+    the model predicts the (near-zero-mean) monthly increment on top of
+    persistence.  This anchors amplitude at persistence and stops MSE from
+    collapsing the bimodal ice concentration to a damped climatology."""
+    def __init__(self, X, Y, mask, norm, augment=False, res_pairs=()):
         self.X, self.Y, self.mask = X, Y, mask
         self.norm, self.augment = norm, augment
+        self.res_pairs = list(res_pairs)
 
     def __len__(self):
         return self.X.shape[0]
@@ -48,6 +55,8 @@ class CiceDataset(Dataset):
         x = np.asarray(self.X[i], dtype=np.float32)
         y = np.asarray(self.Y[i], dtype=np.float32)
         m = np.asarray(self.mask[i], dtype=np.float32)
+        for oc, ic in self.res_pairs:                # residual target (raw units)
+            y[oc] = y[oc] - x[ic]
         x = (x - self.norm.x_mean[:, None, None]) / (self.norm.x_std[:, None, None] + 1e-8)
         y = (y - self.norm.y_mean[:, None, None]) / (self.norm.y_std[:, None, None] + 1e-8)
         if self.augment:
@@ -59,8 +68,13 @@ class CiceDataset(Dataset):
                 torch.from_numpy(np.ascontiguousarray(m)))
 
 
-def compute_norm(X, Y, mask, idx):
-    """Per-channel mean/std over ocean points of the TRAIN split only."""
+def compute_norm(X, Y, mask, idx, res_pairs=()):
+    """Per-channel mean/std over ocean points of the TRAIN split only.  For
+    residual output channels the y stats are computed on (Y - X_prev) so the
+    normalizer matches the residual target the model actually learns."""
+    Xi = np.asarray(X[idx]); Yi = np.asarray(Y[idx]).copy()
+    for oc, ic in res_pairs:
+        Yi[:, oc] -= Xi[:, ic]
     m = mask[idx].astype(bool)                       # (n, nj, ni)
     def stats(A):                                    # A: (n, C, nj, ni)
         C = A.shape[1]
@@ -69,7 +83,7 @@ def compute_norm(X, Y, mask, idx):
             v = A[:, c][m]
             mu[c] = v.mean(); sd[c] = v.std() + 1e-6
         return mu, sd
-    xm, xs = stats(X[idx]); ym, ys = stats(Y[idx])
+    xm, xs = stats(Xi); ym, ys = stats(Yi)
     return Normalizer(xm, xs, ym, ys)
 
 
@@ -84,6 +98,9 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--ema", action="store_true")
+    ap.add_argument("--residual", default="aice,hi",
+                    help="comma list of output vars predicted as a RESIDUAL on their "
+                         "*_prev input (amplitude anchor); '' to disable")
     ap.add_argument("--dry_run", action="store_true", help="tiny subset, 2 epochs")
     args = ap.parse_args()
 
@@ -96,7 +113,17 @@ def main():
     mask = np.load(cache / "mask.npy", mmap_mode="r")
     meta = json.loads((cache / "meta.json").read_text())
     N, n_in = X.shape[0], X.shape[1]; n_out = Y.shape[1]
+    in_vars, out_vars = meta["input_vars"], meta["output_vars"]
     print(f"cache N={N} n_in={n_in} n_out={n_out} grid={X.shape[2]}x{X.shape[3]}")
+
+    # residual targets: map output var -> its <var>_prev input channel
+    res_names = [v for v in args.residual.split(",") if v]
+    res_pairs = []
+    for v in res_names:
+        oc = out_vars.index(v); ic = in_vars.index(f"{v}_prev")
+        res_pairs.append((oc, ic))
+    if res_pairs:
+        print(f"residual targets: {[(out_vars[o], in_vars[i]) for o, i in res_pairs]}")
 
     # temporal split (data are chronological): 80/10/10 train/val/test.
     ntr, nva = int(0.8 * N), int(0.9 * N)
@@ -107,11 +134,11 @@ def main():
         idx_tr, idx_va, idx_te = idx_tr[:32], idx_va[:16], idx_te[:16]
         args.epochs = 2
 
-    norm = compute_norm(X, Y, mask, idx_tr)
+    norm = compute_norm(X, Y, mask, idx_tr, res_pairs)
     norm.save(out / "normalizer.npz")
 
     def loader(idx, aug, shuf):
-        ds = CiceDataset(X[idx], Y[idx], mask[idx], norm, augment=aug)
+        ds = CiceDataset(X[idx], Y[idx], mask[idx], norm, augment=aug, res_pairs=res_pairs)
         return DataLoader(ds, batch_size=args.batch, shuffle=shuf,
                           num_workers=4, pin_memory=(dev == "cuda"), drop_last=shuf)
     dl_tr = loader(idx_tr, args.augment, True)
@@ -146,27 +173,79 @@ def main():
             best_va = va
             torch.save(model.state_dict(), out / "best_model.pt")
 
-    # ---- final test metrics on the held-out tail --------------------------------
+    # ---- final test metrics on the held-out tail (ABSOLUTE space) ---------------
+    # The dataloader yields RESIDUAL targets for aice/hi, so compute_metrics would
+    # report residual R^2 (not comparable).  Reconstruct absolute fields
+    # (aice = aice_prev + dpred, clipped) and score those + the amplitude bias
+    # ratio (mean pred / mean truth over ice cells) -- the number the SST-only v1
+    # got wrong (~0.35).
     if (out / "best_model.pt").exists():
         model.load_state_dict(torch.load(out / "best_model.pt", map_location=dev))
-    met = compute_metrics(model, dl_te, norm, dev, n_out)
     ov = meta["output_vars"]
-    metrics = {v: {"r2": float(met["r2"][i]), "rmse": float(met["rmse"][i]),
-                   "corr": float(met["corr"][i])} for i, v in enumerate(ov)}
+    ym_t = torch.tensor(norm.y_mean[:, None, None], device=dev)
+    ys_t = torch.tensor(norm.y_std[:, None, None], device=dev)
+    res_out2in = {oc: ic for oc, ic in res_pairs}
+    ss_res = np.zeros(n_out); ss_tot = np.zeros(n_out)
+    sum_p = np.zeros(n_out); sum_t = np.zeros(n_out); n_ice = np.zeros(n_out)
+    tmean = np.zeros(n_out); tcnt = 0.0
+    model.eval()
+    with torch.no_grad():
+        for x_n, y_n, m in dl_te:
+            x_n = x_n.to(dev)
+            pred = model(x_n) * ys_t + ym_t                    # denorm (residual for aice/hi)
+            # reconstruct absolute predictions + absolute truth
+            xr_ = x_n * torch.tensor(norm.x_std[:, None, None], device=dev) \
+                  + torch.tensor(norm.x_mean[:, None, None], device=dev)
+            truth = y_n.to(dev) * ys_t + ym_t
+            for oc, ic in res_out2in.items():
+                pred[:, oc] = pred[:, oc] + xr_[:, ic]
+                truth[:, oc] = truth[:, oc] + xr_[:, ic]
+            pred = pred.cpu().numpy(); truth = truth.cpu().numpy()
+            mm = m.numpy().astype(bool)                        # (b, nj, ni)
+            for c in range(n_out):
+                pc, tc = pred[:, c], truth[:, c]
+                sel = mm
+                ss_res[c] += ((pc[sel] - tc[sel]) ** 2).sum()
+                # ice-cell amplitude bias (aice/hi only meaningful where truth>0.15/0.1)
+                ic_sel = sel & (tc > (0.15 if ov[c] == "aice" else 0.1))
+                sum_p[c] += pc[ic_sel].sum(); sum_t[c] += tc[ic_sel].sum(); n_ice[c] += ic_sel.sum()
+                tmean[c] += tc[sel].sum()
+            tcnt += mm.sum()
+    tmean /= max(tcnt, 1)
+    # second pass for ss_tot needs the global mean; approximate with tmean per channel
+    with torch.no_grad():
+        for x_n, y_n, m in dl_te:
+            x_n = x_n.to(dev)
+            xr_ = x_n * torch.tensor(norm.x_std[:, None, None], device=dev) \
+                  + torch.tensor(norm.x_mean[:, None, None], device=dev)
+            truth = y_n.to(dev) * ys_t + ym_t
+            for oc, ic in res_out2in.items():
+                truth[:, oc] = truth[:, oc] + xr_[:, ic]
+            truth = truth.cpu().numpy(); mm = m.numpy().astype(bool)
+            for c in range(n_out):
+                tc = truth[:, c]
+                ss_tot[c] += ((tc[mm] - tmean[c]) ** 2).sum()
+    r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+    rmse = np.sqrt(ss_res / max(tcnt, 1))
+    bias = np.where(sum_t > 0, sum_p / (sum_t + 1e-12), np.nan)
+
+    metrics = {v: {"r2_abs": float(r2[i]), "rmse_abs": float(rmse[i]),
+                   "amp_bias_ratio": float(bias[i])} for i, v in enumerate(ov)}
     (out / "metrics_test.json").write_text(json.dumps(metrics, indent=2))
     (out / "r2_scores.json").write_text(
-        json.dumps({v: float(met["r2"][i]) for i, v in enumerate(ov)}, indent=2))
+        json.dumps({v: float(r2[i]) for i, v in enumerate(ov)}, indent=2))
     (out / "model_config.json").write_text(json.dumps({
         "grid": meta.get("grid", "gx1v7"), "nj": X.shape[2], "ni": X.shape[3],
         "n_in": n_in, "n_out": n_out, "base": args.base,
-        "input_vars": meta["input_vars"], "output_vars": ov,
+        "input_vars": in_vars, "output_vars": ov,
+        "residual_targets": {out_vars[o]: in_vars[i] for o, i in res_pairs},
         "memory_lag_steps": meta.get("memory_lag_steps", 1), "cadence": "monthly",
     }, indent=2))
 
-    print("\nTest R^2 (held-out tail):")
-    for v in ov:
-        print(f"  {v:8s} R2={metrics[v]['r2']:+.3f}  rmse={metrics[v]['rmse']:.3g}  "
-              f"corr={metrics[v]['corr']:+.3f}")
+    print("\nTest metrics (ABSOLUTE space, held-out tail):")
+    for i, v in enumerate(ov):
+        b = f"  amp_bias={bias[i]:.2f}" if v in ("aice", "hi") else ""
+        print(f"  {v:8s} R2={r2[i]:+.3f}  rmse={rmse[i]:.3g}{b}")
     print("wrote", out / "metrics_test.json")
 
 
