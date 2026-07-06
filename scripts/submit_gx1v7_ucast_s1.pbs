@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N gx1_ucast_s1
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_ucast_s1.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/gx1v7_ucast_s1.err
+#PBS -j oe
+
+# U-Cast NATIVE gx1v7, Stage 1: deterministic MAE pre-training on POP's 384x320
+# tripole grid.  Motivation: the lat-lon U-Cast (m377oyqt) coupled through the
+# CAM->gx1v7 remap detonates at the gx1v7 i-seam on the N-Atlantic front (both
+# crashes at i=1-2 / i=317-318); the native ql6lbazr arch has no remap and no
+# seam.  This trains the SAME MAE->CRPS curriculum natively so the probabilistic
+# model can couple seam-free.  Data config mirrors ql6lbazr (same zarr, cache,
+# grid_shape, temporal split, test years); curriculum mirrors
+# submit_mem24h_ucast_s1.pbs (--loss mae --dropout 0.1 --ema).
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+echo "U-Cast NATIVE gx1v7 Stage 1: MAE pre-training (dropout 0.1, EMA) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_ucast \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --with_rad \
+    --with_precip \
+    --loss          mae \
+    --dropout       0.1 \
+    --ema \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --wandb_name    mem24h-gx1v7-ucast-s1-mae \
+    --wandb_project couple-unet
+
+echo "U-Cast NATIVE gx1v7 Stage 1 done at $(date)"
