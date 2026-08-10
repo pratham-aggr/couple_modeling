@@ -41,7 +41,7 @@ ${CESM_ROOT}/cime/scripts/create_newcase \
     --res      ${RES} \
     --project  ${PROJECT} \
     --run-unsupported
-
+    
 cd ${CASE_DIR}
 
 # =============================================================================

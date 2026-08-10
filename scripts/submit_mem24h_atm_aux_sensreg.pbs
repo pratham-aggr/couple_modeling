@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -N unet_aux_sens
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_atm_aux_sensreg.log
+#PBS -j oe
+
+# =============================================================================
+# STAGE 2 of 3 for the CRPS-wind plan: SENSREG (v15 dQ/dSST fix) for the
+# 13-output kvjcofin (output_unet_mem24h_atm_aux, n_in=6 ocean-only -> 8 flux +
+# 5 BL-atm).  The MSE base has NO feedback fix (+7 W/m2/K dQ/dSST -> fast coupled
+# death, the failure sensreg cured for the 8-out kvjcofin -> -22).  Coupled
+# stability needs BOTH the feedback fix (this) AND sharp stress (CRPS, stage 3).
+# --sst_sens_reg is MSE-only in train_unet.py, so it CANNOT be combined with CRPS
+# -> must run first, then warm-start the CRPS fine-tune from THIS output.
+#
+# Same sensreg recipe as the 8-out sensreg_kvjcofin, + --with_atm (keeps 13 out),
+# warm-started from the 13-out MSE base.  GATE (not val-MSE): dQ/dSST audit target
+# -10..-25 (was +7).  Output: output/output_unet_mem24h_atm_aux_sensreg
+# Submit: qsub scripts/submit_mem24h_atm_aux_sensreg.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_mem24h_atm_aux/best_model.pt   # 13-out MSE base
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_atm_aux_sensreg \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --sens_atm_offline \
+    --sst_sens_reg \
+    --sens_lambda     0.2 \
+    --sens_lambda_rad 0.1 \
+    --sens_delta      0.5 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-atm-aux-sensreg \
+    --wandb_project couple-unet
+
+echo "13-out sensreg fine-tune done at $(date)"

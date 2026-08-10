@@ -1,0 +1,54 @@
+#!/bin/bash
+#PBS -N train_remap
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/train_remap.log
+#PBS -e /glade/u/home/praggarwal/couple/output/logs/train_remap.err
+#PBS -j oe
+
+# LEARNABLE REMAPPING around the frozen vfcg1m61 flux UNet (train_remap.py).
+#
+# Trains the gx1v7<->192x288 remaps end-to-end:
+#   gx SST -> EncoderRemap (k-NN, learnable weights, init = production IDW k=4)
+#          -> frozen vfcg1m61 -> DecoderRemap (per-channel 4-pt weights, init =
+#          production bilinear, + zero-init residual CNN on the gx grid)
+#          -> loss vs truth fluxes ON gx1v7 (ocean-masked, normalised MSE).
+# Epoch-0 val R2 (printed as BASELINE) IS the current fixed-remap production
+# pipeline; verified init-equivalence to ScatterToRegular/RegularToScatter at
+# <1e-4 (see scratch verify_remap_init.py, 2026-07-13).
+#
+# Data: index-aligned caches couple_cache_mem24h (CAM) + couple_cache_gx1v7_mem24h
+# (gx).  Temporal split matches vfcg1m61: train 1980-2010, val 2011-12, test 2013-14.
+#
+# Deploy the result with:
+#   model_server.py --grid gx1v7 --arch latlon \
+#       --learned_remap output/output_remap_learnable/remap_best.pt
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=${PBS_JOBID:-none}"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+python -u train_remap.py \
+    --out_dir       ${COUPLE_DIR}/output/output_remap_learnable \
+    --epochs        10 \
+    --batch         16 \
+    --lr            1e-3 \
+    --k_enc         8 \
+    --hidden        48 \
+    --depth         3 \
+    --sum1_w        1e-3 \
+    --num_workers   12 \
+    --amp \
+    --resume \
+    --wandb_project couple-unet \
+    --wandb_name    remap-learnable-v1
+
+echo "PBS job finished: $(date)"

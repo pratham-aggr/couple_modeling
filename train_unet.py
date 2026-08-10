@@ -32,6 +32,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from contextlib import contextmanager
+
+# The verified shr_flux port (camulator_ud/climate/bulk_flux.py) lives beside
+# model_server.py; add that dir to the path so --sst_sens_reg can reuse the exact
+# same air-sea bulk physics the coupler uses to build its SST-sensitivity target.
+import os as _os, sys as _sys
+_CLIMATE_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                             "camulator_ud", "climate")
+if _CLIMATE_DIR not in _sys.path:
+    _sys.path.insert(0, _CLIMATE_DIR)
+try:
+    import bulk_flux
+except Exception:
+    bulk_flux = None   # only required when --sst_sens_reg is passed
 
 try:
     import wandb
@@ -175,6 +189,60 @@ class PairDataset(Dataset):
                 torch.from_numpy(np.ascontiguousarray(m)))
 
 
+# ---------------------------------------------------------------------------
+# SST-sensitivity regularizer (lever 2): make the net's causal dQ/dSST match
+# air-sea bulk physics instead of the learned correlation (dQnet/dSST=+7 W/m2/K,
+# physical -10..-25). Target = shr_flux turbulent damping computed per-sample
+# from the prescribed boundary-layer atmosphere, held fixed while SST is
+# perturbed +-delta. Positive-into-ocean convention (matches the Y fluxes), so
+# the target is ~ -30..-45 W/m2/K.
+# ---------------------------------------------------------------------------
+
+def bulk_sens_target(Ts, ubot, vbot, Tbot, Qbot, PS, delta, hybm_bot):
+    """d(sen+lat)/dSST in W/m^2/K via centered finite difference through the
+    verified bulk_flux port, holding the boundary-layer atm state fixed."""
+    pbot = hybm_bot * PS
+    thbot, rbot, zbot = bulk_flux.state_to_bulk_inputs(Tbot, Qbot, PS, pbot)
+    fp = bulk_flux.flux_atmocn(zbot, ubot, vbot, thbot, Qbot, rbot, Tbot, Ts + delta)
+    fm = bulk_flux.flux_atmocn(zbot, ubot, vbot, thbot, Qbot, rbot, Tbot, Ts - delta)
+    d = ((fp["sen"] + fp["lat"]) - (fm["sen"] + fm["lat"])) / (2.0 * delta)
+    return np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def bulk_turb_delta(Ts, dS, ubot, vbot, Tbot, Qbot, PS, hybm_bot):
+    """One-sided change in the turbulent fluxes when SST shifts by dS at FIXED
+    boundary-layer atmosphere, per the verified bulk_flux (shr_flux) port:
+        dSH = sen(Ts+dS) - sen(Ts) ,  dLH = lat(Ts+dS) - lat(Ts)   [W/m^2, +down]
+    Used to relabel synthetic perturbed-SST training samples so the data itself
+    carries the causal dQ/dSST (~ -30 W/m2/K) instead of the confounded +7
+    correlation — the fit and the physics then agree (plain MSE, no penalty).
+    Non-ocean / invalid cells (nan) return 0 -> target unchanged there."""
+    pbot = hybm_bot * PS
+    thbot, rbot, zbot = bulk_flux.state_to_bulk_inputs(Tbot, Qbot, PS, pbot)
+    f0 = bulk_flux.flux_atmocn(zbot, ubot, vbot, thbot, Qbot, rbot, Tbot, Ts)
+    fd = bulk_flux.flux_atmocn(zbot, ubot, vbot, thbot, Qbot, rbot, Tbot, Ts + dS)
+    dSH = np.nan_to_num(fd["sen"] - f0["sen"], nan=0.0, posinf=0.0, neginf=0.0)
+    dLH = np.nan_to_num(fd["lat"] - f0["lat"], nan=0.0, posinf=0.0, neginf=0.0)
+    return dSH.astype(np.float32), dLH.astype(np.float32)
+
+
+@contextmanager
+def bn_eval(model):
+    """Temporarily put BatchNorm layers in eval mode (use running stats, no
+    running-stat updates) — so the +-delta sensitivity passes measure the same
+    input->output map the coupled run sees (model.eval()), and the finite
+    difference isn't polluted by batch-stat coupling. Conv/GroupNorm untouched."""
+    bns = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+    was = [m.training for m in bns]
+    for m in bns:
+        m.eval()
+    try:
+        yield
+    finally:
+        for m, s in zip(bns, was):
+            m.train(s)
+
+
 class CacheMmapDataset(Dataset):
     """Dataset backed by numpy memmaps. Reads one sample at a time — no bulk list building.
 
@@ -185,7 +253,10 @@ class CacheMmapDataset(Dataset):
 
     def __init__(self, X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm, mask_mm,
                  indices, norm: Normalizer, mem_channels,
-                 dsst_dt=False, augment=False, co2_mm=None, statics=None):
+                 dsst_dt=False, augment=False, co2_mm=None, statics=None,
+                 Xa_mm=None, return_sens=False, sens_delta=0.5, hybm_bot=0.992556,
+                 perturb_frac=0.0, perturb_range=2.0, perturb_mode="sustained",
+                 atm_as_input=True):
         self.X_mm    = X_mm
         self.Y_mm    = Y_mm
         self.Yr_mm   = Yr_mm     # (N, 2, H, W) or None
@@ -199,6 +270,37 @@ class CacheMmapDataset(Dataset):
         self.augment = augment
         self.co2_mm  = co2_mm
         self.statics = statics
+        self.Xa_mm   = Xa_mm     # (N, 5, H, W) BL-state inputs at t_now, or None
+        # SST-sensitivity regularizer target (lever 2): computed here in the
+        # dataloader worker (CPU, overlaps GPU) from the prescribed BL atm state.
+        self.return_sens = return_sens
+        self.sens_delta  = float(sens_delta)
+        self.hybm_bot    = float(hybm_bot)
+        # Lever 2 (data route): with prob perturb_frac, emit a synthetic sample
+        # whose SST is shifted by dS ~ U(-range,+range) and whose turbulent-flux
+        # targets are relabeled by the bulk-physics delta.  Puts the causal
+        # dQ/dSST into the labels so MSE and physics stop fighting.  Two modes:
+        #   sustained: SST_prev shifted too -> dSST_dt input unchanged.
+        #   instant:   SST only -> dSST_dt rises by dS/86400.  The relabel is the
+        #              SAME bulk delta, because bulk flux depends on the SST LEVEL
+        #              and not on its rate of change; this is what collapses the
+        #              +107 W/m2/K instant channel that forces the runtime clamp.
+        #   both:      coin-flip per sample (fixes both channels in one run).
+        # atm_as_input=False: Xa_mm is still read to build the bulk sens/perturb
+        # TARGET, but the BL atm is NOT concatenated onto the net input (keeps n_in
+        # at the no-atm value).  Used by --sens_atm_offline for the wind-free model.
+        self.atm_as_input  = bool(atm_as_input)
+        self.perturb_frac  = float(perturb_frac)
+        self.perturb_range = float(perturb_range)
+        self.perturb_mode  = str(perturb_mode)
+        assert self.perturb_mode in ("sustained", "instant", "both"), \
+            f"unknown perturb_mode {perturb_mode!r}"
+        if return_sens:
+            assert Xa_mm is not None, "--sst_sens_reg requires BL atm inputs (--with_atm_in)"
+            assert bulk_flux is not None, "bulk_flux port failed to import; cannot build sens target"
+        if perturb_frac > 0.0:
+            assert Xa_mm is not None, "--sst_perturb requires BL atm inputs (--with_atm_in)"
+            assert bulk_flux is not None, "bulk_flux port failed to import; cannot build perturbed labels"
 
     def __len__(self):
         return len(self.indices)
@@ -206,6 +308,28 @@ class CacheMmapDataset(Dataset):
     def __getitem__(self, idx):
         i = int(self.indices[idx])
         raw = self.X_mm[i]                        # (6, H, W) float32
+        # Lever 2 data route: turn a fraction of samples into synthetic
+        # perturbed-SST samples with bulk-physics-relabeled turbulent fluxes.
+        do_perturb = (self.perturb_frac > 0.0
+                      and np.random.rand() < self.perturb_frac)
+        dSH = dLH = None
+        if do_perturb:
+            dS = float(np.random.uniform(-self.perturb_range, self.perturb_range))
+            a  = self.Xa_mm[i]    # (5,H,W): Ubot,Vbot,Tbot,Qbot,PS (physical)
+            dSH, dLH = bulk_turb_delta(
+                raw[0].astype(np.float64), dS,
+                a[0].astype(np.float64), a[1].astype(np.float64),
+                a[2].astype(np.float64), a[3].astype(np.float64),
+                a[4].astype(np.float64), self.hybm_bot)   # W/m^2, +down
+            raw = raw.copy()
+            raw[0] = raw[0] + dS                  # SST (perturbed input, both modes)
+            mode = self.perturb_mode
+            if mode == "both":
+                mode = "sustained" if np.random.rand() < 0.5 else "instant"
+            if mode == "sustained":
+                raw[3] = raw[3] + dS              # SST_prev too -> dSST_dt fixed
+            # instant: SST_prev left alone -> dSST_dt jumps by dS/86400, while the
+            # flux relabel below is unchanged (bulk depends on SST level, not rate).
         x = raw[self.mem_ch].copy()               # (C_in, H, W)
         if self.dsst_dt:
             dsst = ((raw[0] - raw[3]) / 86400.0)[None]
@@ -216,23 +340,45 @@ class CacheMmapDataset(Dataset):
                 [x, np.full((1, H, W), float(self.co2_mm[i]), dtype=np.float32)], axis=0)
         if self.statics is not None:
             x = np.concatenate([x, self.statics], axis=0)
+        if self.Xa_mm is not None and self.atm_as_input:
+            x = np.concatenate([x, self.Xa_mm[i]], axis=0)
         y_parts = [self.Y_mm[i]]
         if self.Yr_mm is not None: y_parts.append(self.Yr_mm[i])
         if self.Yp_mm is not None: y_parts.append(self.Yp_mm[i])
         if self.Ya_mm is not None: y_parts.append(self.Ya_mm[i])
         y = np.concatenate(y_parts, axis=0) if len(y_parts) > 1 else y_parts[0].copy()
+        if do_perturb:
+            # Add the bulk turbulent delta to the CREDIT targets (absolute flux
+            # stays CREDIT-accurate; only the SST-derivative becomes bulk-physical).
+            # W/m2 (+down) -> stored J/m2/6h (+into ocean, same sign). Channels:
+            # 2=SHFLX 3=LHFLX. Radiation (FSDS/FLDS), stress, QFLX, PRECT are held
+            # -> teaches dR/dSST=0 (kills the FLDS leak) and ~0 stress sensitivity.
+            y[2] = y[2] + dSH * 21600.0
+            y[3] = y[3] + dLH * 21600.0
         m = self.mask_mm[i].copy()
         x_n = (x - self.norm.x_mean[:, None, None]) / (self.norm.x_std[:, None, None] + 1e-8)
         y_n = (y - self.norm.y_mean[:, None, None]) / (self.norm.y_std[:, None, None] + 1e-8)
+        sens = None
+        if self.return_sens:
+            a = self.Xa_mm[i]     # (5,H,W): Ubot,Vbot,Tbot,Qbot,PS (physical units)
+            sens = bulk_sens_target(raw[0].astype(np.float64), a[0].astype(np.float64),
+                                    a[1].astype(np.float64), a[2].astype(np.float64),
+                                    a[3].astype(np.float64), a[4].astype(np.float64),
+                                    self.sens_delta, self.hybm_bot)   # (H,W) W/m2/K
         if self.augment:
             s = int(np.random.randint(0, x_n.shape[-1]))
             if s:
                 x_n = np.roll(x_n, s, axis=-1)
                 y_n = np.roll(y_n, s, axis=-1)
                 m   = np.roll(m,   s, axis=-1)
-        return (torch.from_numpy(np.ascontiguousarray(x_n.astype(np.float32))),
-                torch.from_numpy(np.ascontiguousarray(y_n.astype(np.float32))),
-                torch.from_numpy(np.ascontiguousarray(m.astype(np.float32))))
+                if sens is not None:
+                    sens = np.roll(sens, s, axis=-1)
+        out = (torch.from_numpy(np.ascontiguousarray(x_n.astype(np.float32))),
+               torch.from_numpy(np.ascontiguousarray(y_n.astype(np.float32))),
+               torch.from_numpy(np.ascontiguousarray(m.astype(np.float32))))
+        if self.return_sens:
+            out = out + (torch.from_numpy(np.ascontiguousarray(sens.astype(np.float32))),)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +594,7 @@ def compute_norm(X_list, Y_list) -> Normalizer:
 
 def compute_norm_from_mmap(X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm,
                             train_idx, mem_channels, dsst_dt,
-                            co2_mm=None, statics=None,
+                            co2_mm=None, statics=None, Xa_mm=None,
                             H=None, W=None, chunk=256) -> Normalizer:
     """Chunked normaliser from memmaps. No np.stack — peak RAM is O(chunk samples)."""
     if H is None: H = X_mm.shape[2]
@@ -456,6 +602,7 @@ def compute_norm_from_mmap(X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm,
     C_x = len(mem_channels) + (1 if dsst_dt else 0)
     if co2_mm is not None: C_x += 1
     if statics is not None: C_x += statics.shape[0]
+    if Xa_mm is not None: C_x += Xa_mm.shape[1]
     C_y = Y_mm.shape[1]
     if Yr_mm is not None: C_y += Yr_mm.shape[1]
     if Yp_mm is not None: C_y += Yp_mm.shape[1]
@@ -463,6 +610,13 @@ def compute_norm_from_mmap(X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm,
 
     s1x = np.zeros(C_x, np.float64); s2x = np.zeros(C_x, np.float64)
     s1y = np.zeros(C_y, np.float64); s2y = np.zeros(C_y, np.float64)
+    # Per-channel reference offsets (first-chunk means) so the streamed variance
+    # E[(x-ref)^2] - (E[x]-ref)^2 avoids catastrophic cancellation. The naive
+    # E[x^2]-E[x]^2 rounds to a tiny negative for small-magnitude channels
+    # (dSST_dt ~1e-6), gets clamped to std=0, and the +1e-8 norm guard then
+    # scales that channel by ~1e8 at inference — the +700 W/m2/K instant-feedback
+    # defect. Centering by ref keeps both terms O(variance) and well-conditioned.
+    refx = refy = None
     npts = 0
     for start in range(0, len(train_idx), chunk):
         bi = train_idx[start:start+chunk]
@@ -477,19 +631,25 @@ def compute_norm_from_mmap(X_mm, Y_mm, Yr_mm, Yp_mm, Ya_mm,
         if statics is not None:
             st = np.broadcast_to(statics[None].astype(np.float64), (len(bi),) + statics.shape)
             x = np.concatenate([x, st], axis=1)
+        if Xa_mm is not None:
+            x = np.concatenate([x, Xa_mm[bi].astype(np.float64)], axis=1)
         y_parts = [Y_mm[bi].astype(np.float64)]
         if Yr_mm is not None: y_parts.append(Yr_mm[bi].astype(np.float64))
         if Yp_mm is not None: y_parts.append(Yp_mm[bi].astype(np.float64))
         if Ya_mm is not None: y_parts.append(Ya_mm[bi].astype(np.float64))
         y = np.concatenate(y_parts, axis=1) if len(y_parts) > 1 else y_parts[0]
-        s1x += x.sum(axis=(0, 2, 3)); s2x += (x**2).sum(axis=(0, 2, 3))
-        s1y += y.sum(axis=(0, 2, 3)); s2y += (y**2).sum(axis=(0, 2, 3))
+        if refx is None:
+            refx = x.mean(axis=(0, 2, 3)); refy = y.mean(axis=(0, 2, 3))
+        xc = x - refx[None, :, None, None]
+        yc = y - refy[None, :, None, None]
+        s1x += xc.sum(axis=(0, 2, 3)); s2x += (xc**2).sum(axis=(0, 2, 3))
+        s1y += yc.sum(axis=(0, 2, 3)); s2y += (yc**2).sum(axis=(0, 2, 3))
         npts += len(bi) * H * W
         if (start // chunk) % 50 == 0:
             print(f"    norm chunk {start+len(bi)}/{len(train_idx)} ...")
-    xm = (s1x/npts).astype(np.float32)
+    xm = (refx + s1x/npts).astype(np.float32)
     xs = np.sqrt(np.maximum(s2x/npts - (s1x/npts)**2, 0)).astype(np.float32)
-    ym = (s1y/npts).astype(np.float32)
+    ym = (refy + s1y/npts).astype(np.float32)
     ys = np.sqrt(np.maximum(s2y/npts - (s1y/npts)**2, 0)).astype(np.float32)
     return Normalizer(xm, xs, ym, ys)
 
@@ -891,8 +1051,12 @@ def _log_rmse_maps(model, val_loader, norm, device, tgt_vars, step=None):
     y_std_cpu  = torch.tensor(norm.y_std)
     y_mean_cpu = torch.tensor(norm.y_mean)
 
-    sse   = np.zeros((n_out, H, W), dtype=np.float64)
-    count = np.zeros((H, W),        dtype=np.float64)
+    # Accumulators are sized from the actual data grid (mask shape), NOT the module
+    # globals H, W: for gx1v7 the per-sample arrays are (384, 320) while --grid_shape
+    # is passed 320 384, so keying off the globals transposes the boolean index and
+    # crashes. Everything else in the pipeline is fully-convolutional / mask-flattened
+    # and orientation-agnostic; only this diagnostic preallocated from H, W.
+    sse = count = None
 
     model.eval()
     with torch.no_grad():
@@ -901,11 +1065,18 @@ def _log_rmse_maps(model, val_loader, norm, device, tgt_vars, step=None):
             pred = (pred_n * y_std_gpu[None,:,None,None] + y_mean_gpu[None,:,None,None]).cpu().numpy()
             true = (y_n    * y_std_cpu[None,:,None,None] + y_mean_cpu[None,:,None,None]).numpy()
             m = mask.numpy() > 0.5
+            if sse is None:
+                gh, gw = m.shape[1], m.shape[2]
+                sse   = np.zeros((n_out, gh, gw), dtype=np.float64)
+                count = np.zeros((gh, gw),        dtype=np.float64)
             err2 = (pred - true) ** 2
             for b in range(pred.shape[0]):
                 sse[:, m[b]] += err2[b][:, m[b]]
                 count[m[b]]  += 1
 
+    if sse is None:            # empty loader: nothing to log
+        model.train()
+        return
     rmse = np.where(count[None] > 0, np.sqrt(sse / np.maximum(count[None], 1)), np.nan)
 
     log_dict = {}
@@ -965,6 +1136,22 @@ def main():
                              "Qbot, PS) as 5 auxiliary output channels, appended LAST. Requires "
                              "Y_atm.npy in the cache dir (run add_atm_to_cache.py first). "
                              "Default off — old runs unchanged.")
+    parser.add_argument("--with_atm_in", action="store_true",
+                        help="Add near-surface atmospheric state at t_now (Ubot, Vbot, Tbot, "
+                             "Qbot, PS) as 5 extra INPUT channels, appended last. Unlike "
+                             "--with_atm (aux targets at t-1), these are concurrent exogenous "
+                             "forcing — the coupled server prescribes the same CREDIT BL state "
+                             "at run time, giving the net real synoptic wind information. "
+                             "Requires X_atm.npy in the cache dir (run "
+                             "add_blstate_to_gx1v7_cache.py first) and --split_mode temporal. "
+                             "Default off — old runs unchanged.")
+    parser.add_argument("--sens_atm_offline", action="store_true",
+                        help="Use the BL atm state ONLY to build the --sst_sens_reg / "
+                             "--sst_perturb bulk-physics target, WITHOUT feeding it to the net "
+                             "(n_in stays at the no-atm value). Lets the wind-free flux net "
+                             "inherit the sensreg dQ/dSST fix for a 500-yr free-running product "
+                             "that needs no prescribed winds. Mutually exclusive with "
+                             "--with_atm_in; still requires X_atm.npy, --memory, temporal split.")
     parser.add_argument("--memory", action="store_true",
                         help="Memory experiment: X = [state_t, state_{t-Nh}] → Y = fluxes_t. "
                              "Uses couple_cache_mem{N}h (6 channels stored; training selects subset).")
@@ -1019,6 +1206,49 @@ def main():
     parser.add_argument("--dsst_dt", action="store_true",
                         help="Append (SST[t]-SST[t-lag])/86400 as an extra input channel. "
                              "Only meaningful with --memory. Stats computed from chosen samples.")
+    # --- Lever 2: SST-sensitivity regularizer (fix dQ/dSST=+7 feedback defect) ---
+    parser.add_argument("--sst_sens_reg", action="store_true",
+                        help="Add a physics penalty forcing the net's causal dQ/dSST to match "
+                             "shr_flux bulk turbulent damping. Requires --with_atm_in (uses the "
+                             "prescribed BL atm state as the fixed background). MSE loss only.")
+    parser.add_argument("--sens_lambda", type=float, default=0.5,
+                        help="Weight on the turbulent-damping term d(SHFLX+LHFLX)/dSST (default 0.5, "
+                             "relative to the normalized-MSE; error scaled by SENS_SCALE=40 W/m2/K).")
+    parser.add_argument("--sens_lambda_rad", type=float, default=0.5,
+                        help="Weight on the radiation-leak term d(FSDS+FLDS)/dSST -> 0 (default 0.5). "
+                             "Kills the learned warm-SST<->clear/moist-sky correlation (dFLDS/dSST=+5.6).")
+    parser.add_argument("--sens_delta", type=float, default=0.5,
+                        help="SST perturbation (K) for the centered finite-difference (default 0.5, "
+                             "matching the dQ/dSST audit; response verified ~linear over +-1 K).")
+    parser.add_argument("--hybm_bot", type=float, default=0.992556,
+                        help="Bottom-level hybm coefficient for pbot=hybm_bot*PS (hyam_bot=0). "
+                             "gx1v7 CREDIT training zarrs: 0.992556.")
+    # --- Lever 2 (data route): SST-perturbed synthetic samples with bulk-relabeled
+    #     turbulent fluxes. Puts the causal dQ/dSST into the LABELS so plain MSE and
+    #     the physics agree (no penalty, no gradient conflict). Alternative to
+    #     --sst_sens_reg; the two are mutually exclusive. ---
+    parser.add_argument("--sst_perturb", action="store_true",
+                        help="Train on a mix of real + synthetic perturbed-SST samples whose "
+                             "turbulent fluxes are relabeled by shr_flux bulk physics (radiation "
+                             "held -> dR/dSST=0). Requires --with_atm_in. MSE loss only. Fixes the "
+                             "dQ/dSST=+7 feedback defect via the data, not a penalty.")
+    parser.add_argument("--perturb_frac", type=float, default=0.5,
+                        help="Fraction of TRAIN samples turned into perturbed-SST synthetic samples "
+                             "each epoch (default 0.5). The fit/physics balance dial.")
+    parser.add_argument("--perturb_range", type=float, default=2.0,
+                        help="Max |dS| (K) for the uniform SST perturbation, dS~U(-range,range) "
+                             "(default 2.0, covers the observed coupled warm-drift range).")
+    parser.add_argument("--perturb_mode", type=str, default="sustained",
+                        choices=["sustained", "instant", "both"],
+                        help="Which dQ/dSST channel the perturbation teaches. 'sustained' shifts "
+                             "SST and SST_prev together (dSST_dt unchanged) = v15. 'instant' shifts "
+                             "SST only, so dSST_dt jumps while the bulk relabel is identical (bulk "
+                             "flux depends on SST level, not rate) -> collapses the +107 W/m2/K "
+                             "instant channel that makes the runtime dSST/dt clamp load-bearing. "
+                             "'both' coin-flips per sample (default: sustained, = v15 behaviour).")
+    parser.add_argument("--init_weights", type=str, default="",
+                        help="Warm-start: load a raw model state_dict (best_model.pt) into the model "
+                             "at init with a fresh optimizer/scheduler. Use to fine-tune v14 -> v15.")
     parser.add_argument("--statics", action="store_true",
                         help="Append static orography fields as extra input channels "
                              "(broadcast, constant in time): improves wind-stress skill near "
@@ -1096,6 +1326,50 @@ def main():
         print("WARNING: --dsst_dt ignored (only meaningful with --memory)")
         args.dsst_dt = False
 
+    if args.with_atm_in:
+        # BL-state inputs are only wired through the memmap cache + the
+        # temporal-split normaliser path (compute_norm_from_mmap / precomputed
+        # normalizer.npz); the random-split cache-norm branch has no stats for them.
+        if not args.memory:
+            raise SystemExit("--with_atm_in requires --memory (cache-aligned BL state)")
+        if args.split_mode != "temporal":
+            raise SystemExit("--with_atm_in requires --split_mode temporal")
+
+    if args.sens_atm_offline:
+        if args.with_atm_in:
+            raise SystemExit("--sens_atm_offline and --with_atm_in are mutually exclusive "
+                             "(offline = atm used for the target only, NOT as a net input)")
+        if not (args.sst_sens_reg or args.sst_perturb):
+            raise SystemExit("--sens_atm_offline only matters with --sst_sens_reg or --sst_perturb")
+        if not args.memory:
+            raise SystemExit("--sens_atm_offline requires --memory (cache-aligned BL state)")
+        if args.split_mode != "temporal":
+            raise SystemExit("--sens_atm_offline requires --split_mode temporal")
+
+    # BL atm is available for the bulk target if it is either a net input OR loaded offline.
+    _atm_available = args.with_atm_in or args.sens_atm_offline
+
+    if args.sst_sens_reg:
+        if not _atm_available:
+            raise SystemExit("--sst_sens_reg requires the BL atm state (--with_atm_in, or "
+                             "--sens_atm_offline to use it for the target only)")
+        if args.loss != "mse":
+            raise SystemExit("--sst_sens_reg is only implemented for --loss mse")
+        if bulk_flux is None:
+            raise SystemExit("--sst_sens_reg needs camulator_ud/climate/bulk_flux.py on the path")
+
+    if args.sst_perturb:
+        if args.sst_sens_reg:
+            raise SystemExit("--sst_perturb and --sst_sens_reg are mutually exclusive "
+                             "(two different lever-2 approaches; pick one)")
+        if not _atm_available:
+            raise SystemExit("--sst_perturb requires the BL atm state (--with_atm_in, or "
+                             "--sens_atm_offline to use it for the relabeling only)")
+        if args.loss != "mse":
+            raise SystemExit("--sst_perturb is only implemented for --loss mse")
+        if bulk_flux is None:
+            raise SystemExit("--sst_perturb needs camulator_ud/climate/bulk_flux.py on the path")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1115,7 +1389,8 @@ def main():
     input_vars = (input_vars_base
                   + (["dSST_dt"] if args.dsst_dt else [])
                   + (["CO2"]     if args.with_co2 else [])
-                  + (list(args.statics_vars) if args.statics else []))
+                  + (list(args.statics_vars) if args.statics else [])
+                  + (ATM_VARS if args.with_atm_in else []))
 
     use_wandb = WANDB_AVAILABLE and args.wandb_project is not None
     if use_wandb:
@@ -1246,6 +1521,16 @@ def main():
             assert yatm_path.exists(), "Y_atm.npy not found — run add_atm_to_cache.py first"
             yatm_np = np.load(yatm_path, mmap_mode="r")            # (N, 5, H, W)
             print(f"  Auxiliary atm targets enabled (t-1): {ATM_VARS}")
+        xatm_np = None
+        if args.with_atm_in or args.sens_atm_offline:
+            xatm_path = cache_dir / "X_atm.npy"
+            assert xatm_path.exists(), \
+                "X_atm.npy not found — run add_blstate_to_gx1v7_cache.py first"
+            xatm_np = np.load(xatm_path, mmap_mode="r")            # (N, 5, H, W)
+            if args.with_atm_in:
+                print(f"  BL-state input channels enabled (t_now): {ATM_VARS}")
+            else:
+                print(f"  BL-state loaded for sens target ONLY (offline, not a net input): {ATM_VARS}")
         N_full  = len(X_np)
         # Apply subsample via random selection
         chosen = rng.choice(N_full, size=max(1, int(N_full * args.subsample)), replace=False)
@@ -1261,6 +1546,10 @@ def main():
             raise NotImplementedError(
                 "--statics is only wired through the cache path (use --memory with a "
                 "precomputed cache). Build the cache first, then rerun with --statics.")
+        if args.with_atm_in:
+            raise NotImplementedError(
+                "--with_atm_in is only wired through the cache path (X_atm.npy). "
+                "Build the cache first, then rerun with --with_atm_in.")
         print("\nLoading data from zarr ...")
         X_all, Y_all, mask_all = [], [], []
         years_all_list = []
@@ -1326,7 +1615,9 @@ def main():
             norm = compute_norm_from_mmap(
                 X_np, Y_np, yrad_np, yprecip_np, yatm_np,
                 chosen[ti], mem_channels, args.dsst_dt,
-                co2_mm=co2_np, statics=statics, H=H, W=W, chunk=256)
+                co2_mm=co2_np, statics=statics,
+                Xa_mm=(xatm_np if args.with_atm_in else None),   # offline: atm not a net channel
+                H=H, W=W, chunk=256)
         else:
             print("Computing normalisation stats from training samples ...")
             norm = compute_norm([X_all[k] for k in ti], [Y_all[k] for k in ti])
@@ -1389,6 +1680,9 @@ def main():
         norm = compute_norm(X_all, Y_all)
     if not precomp_norm.exists():
         norm.save(out_dir / "normalizer.npz")
+    assert len(norm.x_mean) == len(input_vars), \
+        (f"normaliser has {len(norm.x_mean)} input channels but input_vars has "
+         f"{len(input_vars)} — stale normalizer.npz in out_dir? Delete it and rerun.")
     for i, v in enumerate(input_vars):
         print(f"  {v:10s}: mean={norm.x_mean[i]:.3f}  std={norm.x_std[i]:.3f}")
     for i, v in enumerate(tgt_vars):
@@ -1444,11 +1738,18 @@ def main():
 
     if cache_ok:
         _mm_kwargs = dict(norm=norm, mem_channels=mem_channels, dsst_dt=args.dsst_dt,
-                          co2_mm=co2_np, statics=statics)
+                          co2_mm=co2_np, statics=statics, Xa_mm=xatm_np,
+                          atm_as_input=args.with_atm_in,   # offline: atm feeds the target only
+                          sens_delta=args.sens_delta, hybm_bot=args.hybm_bot)
+        # Only the training loader needs the bulk-flux sensitivity target.
         trn_ds = CacheMmapDataset(X_np, Y_np, yrad_np, yprecip_np, yatm_np, mask_np,
-                                   chosen[ti], augment=args.augment, **_mm_kwargs)
+                                   chosen[ti], augment=args.augment,
+                                   return_sens=args.sst_sens_reg,
+                                   perturb_frac=(args.perturb_frac if args.sst_perturb else 0.0),
+                                   perturb_range=args.perturb_range,
+                                   perturb_mode=args.perturb_mode, **_mm_kwargs)
         val_ds = CacheMmapDataset(X_np, Y_np, yrad_np, yprecip_np, yatm_np, mask_np,
-                                   chosen[vi], augment=False, **_mm_kwargs)
+                                   chosen[vi], augment=False, return_sens=False, **_mm_kwargs)
     else:
         trn_ds = PairDataset([X_all[i] for i in ti], [Y_all[i] for i in ti],
                              [mask_all[i] for i in ti], norm, augment=args.augment)
@@ -1474,6 +1775,11 @@ def main():
     # --- Model ---
     model = UNet(n_in=len(input_vars), n_out=n_out, base=args.base,
                  dropout=args.dropout).to(device)
+    if args.init_weights:
+        print(f"Warm-start: loading weights from {args.init_weights} "
+              f"(fresh optimizer/scheduler) ...")
+        _sd = torch.load(args.init_weights, map_location=device, weights_only=True)
+        model.load_state_dict(_sd)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nUNet: {n_params:,} parameters  (base={args.base}, "
           f"n_in={len(input_vars)}, n_out={n_out}, dropout={args.dropout})")
@@ -1481,6 +1787,7 @@ def main():
           + (f" (M={args.crps_members} members)" if args.loss == 'crps' else ""))
 
     json.dump({"n_in": len(input_vars), "n_out": n_out, "base": args.base,
+               "dropout": args.dropout,
                "input_vars": input_vars, "output_vars": tgt_vars, "daily": daily},
               open(out_dir / "model_config.json", "w"), indent=2)
 
@@ -1631,12 +1938,33 @@ def main():
 
     vi_indices = np.array(vi)  # save before inner loops shadow `vi`
 
+    # --- Lever-2 SST-sensitivity regularizer constants (fixed across training) ---
+    sens_reg = args.sst_sens_reg
+    if sens_reg:
+        SENS_SCALE = 40.0                        # W/m2/K, normalizes the penalty to O(1)
+        J2W        = 1.0 / 21600.0               # J/m2/6h  ->  W/m2 (fluxes stored per 6h)
+        SHFLX_I, LHFLX_I, FSDS_I, FLDS_I = 2, 3, 5, 6   # output-channel indices
+        y_std_t = torch.tensor(norm.y_std, dtype=torch.float32, device=device)
+        # normalized SST perturbation (SST and SST_prev share x_std here)
+        dnorm0 = args.sens_delta / (float(norm.x_std[0]) + 1e-8)
+        dnorm3 = args.sens_delta / (float(norm.x_std[3]) + 1e-8)
+        print(f"\nSST-sensitivity reg ON: delta={args.sens_delta} K  "
+              f"lambda_turb={args.sens_lambda}  lambda_rad={args.sens_lambda_rad}  "
+              f"scale={SENS_SCALE} W/m2/K")
+
     for epoch in range(start_epoch, total_epochs + 1):
         model.train()
         trn_loss = 0.0
+        trn_mse = trn_sturb = trn_srad = 0.0     # sensitivity-term diagnostics
+        trn_conflict = 0.0                        # frac of steps where sens vs mse grad conflict
         t_ep = time_module.time()
 
-        for x_n, y_n, mask in trn_loader:
+        for batch in trn_loader:
+            if sens_reg:
+                x_n, y_n, mask, sens_t = batch
+                sens_t = sens_t.to(device)       # (B,H,W) bulk d(sen+lat)/dSST target
+            else:
+                x_n, y_n, mask = batch
             x_n  = x_n.to(device)
             y_n  = y_n.to(device)
             mask = mask.to(device)
@@ -1647,11 +1975,66 @@ def main():
                 loss = masked_mae(model(x_n), y_n, mask, lat_w=lat_w, var_w=var_w)
             else:
                 loss = masked_mse(model(x_n), y_n, mask, lat_w=lat_w, var_w=var_w)
-            optimizer.zero_grad()
-            loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+
+            if sens_reg:
+                mse_loss = loss                       # keep the MSE graph for PCGrad
+                mse_val  = float(mse_loss.item())
+                # Centered SST perturbation, BL atm channels held fixed. BN in eval
+                # so the finite difference reflects the deployed (model.eval()) map.
+                x_plus  = x_n.clone(); x_plus[:, 0]  += dnorm0; x_plus[:, 3]  += dnorm3
+                x_minus = x_n.clone(); x_minus[:, 0] -= dnorm0; x_minus[:, 3] -= dnorm3
+                with bn_eval(model):
+                    pboth = model(torch.cat([x_plus, x_minus], dim=0))
+                B = x_n.shape[0]
+                pp, pm = pboth[:B], pboth[B:]
+                inv2d = 1.0 / (2.0 * args.sens_delta)
+                # net causal dQ/dSST in W/m2/K (y_mean cancels in the difference)
+                d_turb = ((pp[:, SHFLX_I] - pm[:, SHFLX_I]) * y_std_t[SHFLX_I]
+                          + (pp[:, LHFLX_I] - pm[:, LHFLX_I]) * y_std_t[LHFLX_I]) * (J2W * inv2d)
+                d_rad  = ((pp[:, FSDS_I] - pm[:, FSDS_I]) * y_std_t[FSDS_I]
+                          + (pp[:, FLDS_I] - pm[:, FLDS_I]) * y_std_t[FLDS_I]) * (J2W * inv2d)
+                msum = mask.sum() + 1e-8
+                l_turb = ((((d_turb - sens_t) / SENS_SCALE) ** 2) * mask).sum() / msum
+                l_rad  = (((d_rad / SENS_SCALE) ** 2) * mask).sum() / msum
+                sens_loss = args.sens_lambda * l_turb + args.sens_lambda_rad * l_rad
+
+                # --- PCGrad gradient surgery ---------------------------------
+                # The training labels ENCODE the +7 W/m2/K correlation, so the raw
+                # sensitivity gradient collides head-on with the MSE gradient (both
+                # lambda extremes failed: the fit blows up, or sturb won't fall).
+                # Take the two gradients separately (independent forward graphs) and,
+                # only when they conflict (g_sens . g_mse < 0), remove the projection
+                # of g_sens onto g_mse — physics then bends the fit only in its
+                # null-space, and helpful/agreeing sens gradient is kept in full.
+                params = [p for p in model.parameters() if p.requires_grad]
+                g_mse  = torch.autograd.grad(mse_loss,  params, allow_unused=True)
+                g_sens = torch.autograd.grad(sens_loss, params, allow_unused=True)
+                dot = sum(float((gm * gs).sum()) for gm, gs in zip(g_mse, g_sens)
+                          if gm is not None and gs is not None)
+                mse_sq = sum(float((gm * gm).sum()) for gm in g_mse
+                             if gm is not None) + 1e-12
+                coef = (dot / mse_sq) if dot < 0.0 else 0.0   # project only on conflict
+                optimizer.zero_grad()
+                for p, gm, gs in zip(params, g_mse, g_sens):
+                    g = gm.clone() if gm is not None else None
+                    if gs is not None:
+                        gsp = (gs - coef * gm) if (coef != 0.0 and gm is not None) else gs
+                        g = gsp if g is None else g + gsp
+                    p.grad = g
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                trn_mse      += mse_val
+                trn_sturb    += float(l_turb.item())
+                trn_srad     += float(l_rad.item())
+                trn_conflict += 1.0 if dot < 0.0 else 0.0
+                loss = (mse_loss + sens_loss).detach()   # for trn_loss logging only
+            else:
+                optimizer.zero_grad()
+                loss.backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
             if muon_opt is not None:
                 muon_opt.step()
             if ema is not None:
@@ -1709,6 +2092,11 @@ def main():
         trn_loss    /= len(trn_loader)
         val_loss    /= max(1, len(val_loader))
         val_loss_pv /= max(1, len(val_loader))
+        if sens_reg:
+            trn_mse      /= len(trn_loader)
+            trn_sturb    /= len(trn_loader)
+            trn_srad     /= len(trn_loader)
+            trn_conflict /= len(trn_loader)
         history.append((trn_loss, val_loss))
         scheduler.step()
 
@@ -1751,11 +2139,14 @@ def main():
 
         es_tag = f"  no_improve={no_improve}/{args.patience}" if early_stop else ""
         lr_now = scheduler.get_last_lr()[0]
+        sens_tag = (f"  [mse={trn_mse:.4f} sturb={trn_sturb:.3f} srad={trn_srad:.3f}"
+                    f" conflict={trn_conflict:.2f}]"
+                    if sens_reg else "")
         print(f"Epoch {epoch:3d}/{total_epochs}  "
               f"trn={trn_loss:.4f}  val={val_loss:.4f}  "
               f"lr={lr_now:.1e}  "
               f"({'*' if improved else ' '}) "
-              f"({time_module.time()-t_ep:.0f}s){es_tag}")
+              f"({time_module.time()-t_ep:.0f}s){es_tag}{sens_tag}")
 
         if use_wandb:
             log_dict = {
@@ -1765,6 +2156,11 @@ def main():
             }
             if early_stop:
                 log_dict["early_stop/no_improve"] = no_improve
+            if sens_reg:
+                log_dict["train/mse"]         = trn_mse
+                log_dict["train/sens_turb"]   = trn_sturb
+                log_dict["train/sens_rad"]    = trn_srad
+                log_dict["train/grad_conflict"] = trn_conflict
             for vi, vname in enumerate(tgt_vars):
                 log_dict[f"val/loss_{vname}"] = val_loss_pv[vi]
                 if var_w is not None:

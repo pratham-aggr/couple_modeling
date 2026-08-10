@@ -1,0 +1,101 @@
+#!/bin/bash
+#PBS -N gx1_perturb2
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=06:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_perturb2.log
+#PBS -j oe
+
+# =============================================================================
+# v16 = LEVER 2, PHASE 2: fix the INSTANT dQ/dSST channel.
+#
+# WHY (measured, not guessed). The v15 coupled 1-yr run (job 6826048, rc=0)
+# showed the SUSTAINED fix alone is NOT the drift lever:
+#     Dec-1980 global SST   v8 21.38 | v14 19.99 | v15 19.86 | truth 18.69
+# i.e. residual drift +1.30 -> +1.17 K, only ~10% removed, and the SHAPE of the
+# monthly curve is unchanged (same summer plateau, same autumn re-warming) —
+# v15 bought a constant ~-0.12 K offset, nothing structural.
+#
+# The surviving runaway is the INSTANT channel, which both v15 variants left
+# untouched (they hold dSST_dt fixed by construction):
+#     INSTANT dQnet/dSST   v14 +116.8 -> v15 +107.3 W/m2/K   (should be ~ -30)
+# It is why the runtime +-0.1 K/day dSST/dt clamp is load-bearing — the v15
+# server log shows it firing on 37698 cells (max |dSST/dt| = 2.00 K/day). A
+# clamp holding ~1/3 of the ocean together IS a flux adjustment, so it cannot
+# ship; the net has to learn the right response instead of being restrained.
+#
+# THE FIX (--perturb_mode instant, same data route, no penalty, NO CREDIT ML):
+# shift SST ONLY by dS ~ U(-2,+2) K, leaving SST_prev alone, so the dSST_dt input
+# channel jumps -- and relabel SHFLX/LHFLX with the *same* shr_flux bulk delta
+# bulk(SST+dS) - bulk(SST) at fixed BL atmosphere.  That is the whole physical
+# argument: an air-sea bulk flux depends on the SST LEVEL, not on its rate of
+# change, so the correct label under an instant perturbation is identical to the
+# sustained one.  Training on it collapses the +107 toward the bulk -30.
+# Side benefit: real data has |dSST_dt| ~ 0.06 K/day, while the coupled run hits
+# 2 K/day (~30 sigma out of distribution, where the net was extrapolating
+# garbage).  These samples populate exactly that regime.
+#
+# --perturb_mode both: coin-flip sustained/instant per perturbed sample, so this
+# single run keeps v15's sustained gain (-30 W/m2/K, FLDS leak dead) AND fixes
+# the instant channel.  frac 0.6 -> 30% sustained / 30% instant / 40% real.
+#
+# Warm-start from the v15 perturb checkpoint (already has the sustained physics)
+# rather than v14, so this is an increment on top of a validated model.
+#
+# GATE (not val-MSE): scratchpad/diag_dqdsst_atmin.py on the new ckpt must show
+#   INSTANT   dQnet/dSST  +107 -> roughly -10..-40   (the actual target)
+#   SUSTAINED dQnet/dSST  stays near -30             (must not regress)
+#   val       stays near 0.049                        (fit preserved)
+# THEN a coupled 1-yr clone of run_pop_gx1v7_v15perturb.pbs with the dSST/dt
+# clamp RELAXED — the point of this lever is to retire the clamp, so leaving it
+# on would hide whether the fix worked.
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_perturb/best_model.pt
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (silent CPU fallback wastes the walltime).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_perturb2 \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm_in \
+    --sst_perturb \
+    --perturb_mode  both \
+    --perturb_frac  0.6 \
+    --perturb_range 2.0 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-perturb2 \
+    --wandb_project couple-unet
+
+echo "v16 perturb2 (instant+sustained data route) training session done at $(date)"

@@ -1,0 +1,65 @@
+#!/bin/bash
+#PBS -N gx1_atmin
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atmin.log
+#PBS -j oe
+
+# v14 UNet ("atmin"): EXACT ql6lbazr recipe (recovered from wandb-metadata.json) + ONE
+# change: --with_atm_in appends the CREDIT boundary-layer state at t_now
+# (Ubot/Vbot/Tbot/Qbot/PS, X_atm.npy, remap bit-identical to the training
+# zarrs) as 5 extra input channels — n_in 6 -> 11.
+#
+# Why: v12 coupled fair test (job 6729864) proved the sign-fixed ql6lbazr
+# restores circulation direction but its wind-stress MAGNITUDE stays collapsed
+# (40-50S Dec TAUX +0.003 vs stock +1.02 dyn/cm2): the net reads storms from
+# the 24-h SST-tendency channel, which the standalone loop cannot populate
+# (T1/P3 offline experiment). The BL state is prescribed CREDIT forcing,
+# available identically at train and coupled-run time, and carries the
+# synoptic signal directly.  Safe to resubmit: --resume continues from
+# checkpoint.pt if present.
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (job 5200022 on casper41 hit "CUDA unknown
+# error" at torch init and silently trained on CPU for 12 h). Better to die
+# and be resubmitted than to burn a 24 h walltime on 16 CPU cores.
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atmin \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm_in \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    500 \
+    --patience      40 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-atmin \
+    --wandb_project couple-unet
+
+echo "v14 atmin training session done at $(date)"

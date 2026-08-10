@@ -1,0 +1,93 @@
+#!/bin/bash
+#PBS -N gx1_sensreg_crps
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=08:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_sensreg_crps.log
+#PBS -j oe
+
+# =============================================================================
+# v15 sensreg -> PROBABILISTIC (U-Cast Stage 2): CRPS fine-tune with MC Dropout.
+#
+# Turns the DETERMINISTIC, drift-fixed production model (output_unet_gx1v7_sensreg,
+# n_in=11, dropout=0.1, MSE-trained) into a CALIBRATED probabilistic ensemble by
+# fine-tuning on the unbiased CRPS estimator (Skill - 0.5*Spread; Zamo & Naveau
+# 2018) with 10% MC Dropout, exactly the U-Cast recipe (papers/ucast.pdf, Sec 3.2).
+# The sensreg checkpoint ALREADY carries dropout=0.1 weights, so MC-Dropout works
+# at inference with zero retraining (see memo-mc-dropout-probabilistic); THIS run
+# only improves ensemble CALIBRATION (MSE-trained dropout is under-dispersive,
+# U-Cast Sec 3.3).
+#
+# Init WEIGHTS-ONLY from the production sensreg checkpoint (fresh optimizer/
+# scheduler), same 11 input channels (--with_atm_in), same n_out=8. AdamW lr=1e-4
+# + grad_clip + EMA (the U-Cast/ gx1v7-ucast-s2 setting that CONVERGED; Muon 2e-3
+# diverged there). Writes to a NEW out_dir so production sensreg is NEVER touched.
+#
+# ** SCIENTIFIC GUARDRAIL ** --sst_sens_reg is MSE-only (mutually exclusive with
+# --loss crps), so the dQ/dSST=+7 -> physical damping fix that v15 bought is NOT
+# actively protected during this CRPS stage. That is why the fine-tune is kept
+# SHORT (8 epochs, U-Cast Stage 2 length) at a low LR: long CRPS training could
+# pull the feedback back toward the +7 correlation defect and reintroduce the
+# drift. DO NOT deploy output_unet_gx1v7_sensreg_crps in a coupled run until the
+# offline dQ/dSST audit + a 1-yr drift check confirm the damping survived (same
+# gate the sensreg script used: "the REAL gate is the offline dQ/dSST audit +
+# coupled drift, not val-MSE"). Ensemble skill/calibration lands in
+# crps_ssr_test.json (target SSR ~1; MSE-trained baseline was under-dispersive).
+#
+# Resubmit-safe: --resume continues from checkpoint.pt in out_dir once one exists
+# (the resume block overrides --init_weights).
+# Chain from a fresh Stage-1? Not needed -- sensreg IS the converged Stage-1.
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_sensreg/best_model.pt
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (silent CPU fallback wastes the walltime).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+echo "v15 sensreg -> CRPS probabilistic fine-tune (U-Cast Stage 2) at $(date)"
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_sensreg_crps \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm_in \
+    --with_rad \
+    --with_precip \
+    --loss          crps \
+    --dropout       0.1 \
+    --crps_members  2 \
+    --optimizer     adamw \
+    --lr            1e-4 \
+    --grad_clip     1.0 \
+    --init_weights  ${INIT_CKPT} \
+    --resume \
+    --ema \
+    --eval_prob \
+    --eval_members  8 \
+    --max_epochs    8 \
+    --patience      8 \
+    --batch         8 \
+    --base          64 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --wandb_name    mem24h-gx1v7-sensreg-crps \
+    --wandb_project couple-unet
+
+echo "v15 sensreg CRPS fine-tune done at $(date)"
+echo "NEXT: re-run the offline dQ/dSST audit on output_unet_gx1v7_sensreg_crps"
+echo "      BEFORE any coupled deploy (guardrail: CRPS stage drops the sens reg)."

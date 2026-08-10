@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -N gx1_sensreg_kvj
+#PBS -A NAML0001
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_sensreg_kvjcofin.log
+#PBS -j oe
+
+# =============================================================================
+# WIND-FREE flux net, sensreg fine-tune WARM-STARTED FROM kvjcofin (user req).
+#
+# kvjcofin (mem24h-atm-aux) is an n_in=6 OCEAN-ONLY flux net that already
+# predicts the fluxes we want (its aux-wind co-training sharpened TAUX/TAUY).
+# The coupled test of kvjcofin as-is (job 6977135) is measuring its drift; this
+# job fixes its one flaw -- the +7 W/m2/K dQ/dSST feedback -- with the sensreg
+# regularizer, so the wind-free net gets physical turbulent damping WITHOUT ever
+# needing winds at inference. Pathway 1 toward a 500-yr free-running product.
+#
+# Warm-start = the kvjcofin checkpoint SLICED to its 8 flux outputs
+# (output_unet_gx1v7_kvjcofin_flux8; head[:8], normalizer y[:8]) so training is
+# n_out=8 and DIRECTLY DEPLOYABLE (no re-slice). The sliced backbone still
+# carries kvjcofin's aux-wind-informed weights. PCGrad keeps the MSE fit at full
+# strength while sensreg bends the SST-sensitivity.
+#
+# --sens_atm_offline: BL atm builds the bulk dQ/dSST TARGET only, NOT a net input.
+# GATE (not val-MSE): offline dQ/dSST audit (target -10..-25, was +7) then a
+# coupled 1-yr drift test with NO --with_atm_in vs the prescribed-wind v15 year
+# (Jan->Dec +0.002 K). Safe to resubmit: --resume continues from checkpoint.pt.
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_kvjcofin_flux8/best_model.pt  # n_in=6 n_out=8
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_sensreg_kvjcofin \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --sens_atm_offline \
+    --sst_sens_reg \
+    --sens_lambda     0.2 \
+    --sens_lambda_rad 0.1 \
+    --sens_delta      0.5 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-sensreg-kvjcofin \
+    --wandb_project couple-unet
+
+echo "kvjcofin sensreg fine-tune done at $(date)"

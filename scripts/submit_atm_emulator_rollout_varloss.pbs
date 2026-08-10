@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -N atm_roll_var
+#PBS -A UCSD0085
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=32:ngpus=2:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/atm_emulator_rollout_varloss.log
+#PBS -j oe
+
+# =============================================================================
+# OPTION A: VARIANCE-PRESERVING rollout wind emulator (2 x A100), tracked wandb.
+#
+# Fixes the residual pathway-B drift that the wind CLIP (lever 3) could not:
+# the generated winds regress to the conditional MEAN (MSE-optimal but variance-
+# collapsed) -> <|wind|> ~5-6 m/s vs truth 7.3 -> dead ventilation -> +1.37 K/yr
+# warm drift (job 7002971), ~ the same as having no winds at all.
+#
+# --var_loss_weight adds a variance + spatial-gradient-energy matching penalty to
+# the rollout MSE so the emulator keeps realistic synoptic wind amplitude/structure
+# instead of smoothing it away. ISOLATED test: variance loss ONLY, NO --sst_perturb
+# (OOD robustness is covered by the parallel lever-1 job 5500660), so comparing this
+# run's |wind|@120 probe against the deployed baseline (output_atm_emulator_rollout,
+# ~6.6 m/s) cleanly measures the variance-loss effect on wind magnitude/ventilation.
+#
+# Isolated out_dir: output/output_atm_emulator_rollout_varloss (touches nothing else).
+# Submit:  qsub scripts/submit_atm_emulator_rollout_varloss.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -c "import torch; n=torch.cuda.device_count(); assert n>=2, f'need 2 GPUs, got {n}'; print('GPUs:', [torch.cuda.get_device_name(i) for i in range(n)])"
+
+python -u train_atm_emulator_rollout.py \
+    --out_dir     output/output_atm_emulator_rollout_varloss \
+    --train_years 1980-2010 \
+    --val_years   2011-2012 \
+    --test_years  2013-2014 \
+    --rollout        8 \
+    --rollout_start  2 \
+    --rollout_ramp_epochs 8 \
+    --stride      2 \
+    --epochs      40 \
+    --batch       16 \
+    --base        64 \
+    --lr          3e-4 \
+    --dropout     0.1 \
+    --ema \
+    --probe_steps 120 \
+    --var_loss_weight 0.1 \
+    --wandb_name    mem24h-atm-roll-varloss \
+    --wandb_project couple-unet
+
+echo "atm rollout training done $(date)"

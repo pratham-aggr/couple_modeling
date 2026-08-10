@@ -1,0 +1,63 @@
+#!/bin/bash
+#PBS -N unet_aux_crps
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unet_mem24h_atm_aux_crps.log
+#PBS -j oe
+
+# =============================================================================
+# U-Cast STAGE-2: CRPS probabilistic fine-tune of the 13-output kvjcofin
+# (output_unet_mem24h_atm_aux, n_in=6 ocean-only -> 8 fluxes + 5 BL-atm).
+#
+# Goal (user hypothesis): MSE regressed winds/stress to the blurry conditional
+# mean (TAUX R2 0.71, TAUY 0.62, Ubot 0.81, Vbot 0.73). CRPS fine-tuning with MC
+# Dropout (Cachay et al. "U-Cast", papers/ucast.pdf, Sec 3.2-3.3) represents the
+# weather-unpredictable part of the wind as calibrated SPREAD instead of smoothing
+# it away -> sharper, better-calibrated stress. Since prescribed-wind coupling is
+# stable (+0.002 K), sharper predicted stress should make the fully-predicted
+# coupling behave like v15.
+#
+# Faithful U-Cast Stage-2: warm-start the converged MSE backbone, enable dropout,
+# M=2 ensemble, optimize unbiased CRPS (skill-0.5*spread) with Muon, few epochs.
+# Uniform CRPS over all 13 (--loss_weights only supports 5 chans, unusable at 13).
+# Isolated out_dir. Submit: qsub scripts/submit_mem24h_atm_aux_crps.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/wchapman/b_credit_runs/b.e21.CREDIT_climate_branch_1980_????_zmdata_ERA5scaled_zmdata_Qtot.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_mem24h_atm_aux/best_model.pt   # 13-out MSE base (FAST-TEST path: CRPS-only, no sensreg; feedback confound accepted)
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_atm_aux_crps \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --with_atm \
+    --loss          crps \
+    --crps_members  2 \
+    --optimizer     adamw \
+    --lr            1e-4 \
+    --init_weights  "${INIT_CKPT}" \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    15 \
+    --patience      15 \
+    --batch         8 \
+    --base          64 \
+    --wandb_name    mem24h-atm-aux-crps \
+    --wandb_project couple-unet
+
+echo "Done at $(date)"

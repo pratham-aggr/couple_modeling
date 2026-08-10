@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N atm_rollout
+#PBS -A UCSD0085
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=32:ngpus=2:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/atm_emulator_rollout.log
+#PBS -j oe
+
+# =============================================================================
+# ROLLOUT-TRAINED autoregressive BL-atm emulator (2 x A100), tracked on wandb.
+#
+# Fixes the one-step emulator's closed-loop blowup (coupled job 6969200: winds
+# -> 20.6 m/s in 30 days -> POP k.e.>100) by TRAINING on the autoregressive
+# rollout it will actually run: unroll K steps feeding the model its OWN output,
+# backprop through the whole rollout (BPTT), curriculum-grow K from 2 -> 8.
+#
+# SAME network as v15 (train_unet.UNet, base=64), just the wind I/O head, on the
+# full 1980-2010 / 2011-12 / 2013-14 split. A free-run stability probe logs
+# <|wind|> at 30/60/120 steps every epoch (the blowup detector): success = it
+# stays near truth ~7 m/s instead of running to 20+.
+#
+# Isolated: writes only output/output_atm_emulator_rollout (does NOT touch the
+# deployed output_atm_emulator). Submit:
+#   qsub scripts/submit_atm_emulator_rollout.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -c "import torch; n=torch.cuda.device_count(); assert n>=2, f'need 2 GPUs, got {n}'; print('GPUs:', [torch.cuda.get_device_name(i) for i in range(n)])"
+
+python -u train_atm_emulator_rollout.py \
+    --out_dir     output/output_atm_emulator_rollout \
+    --train_years 1980-2010 \
+    --val_years   2011-2012 \
+    --test_years  2013-2014 \
+    --rollout        8 \
+    --rollout_start  2 \
+    --rollout_ramp_epochs 8 \
+    --stride      2 \
+    --epochs      40 \
+    --batch       16 \
+    --base        64 \
+    --lr          3e-4 \
+    --dropout     0.1 \
+    --ema \
+    --probe_steps 120 \
+    --wandb_name    mem24h-atm-rollout \
+    --wandb_project couple-unet
+
+echo "atm rollout training done $(date)"

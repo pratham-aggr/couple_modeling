@@ -1,0 +1,88 @@
+#!/bin/bash
+#PBS -N gx1_perturb
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_perturb.log
+#PBS -j oe
+
+# =============================================================================
+# v15 LEVER 2 — DATA ROUTE (user-selected 2026-07-18 after the penalty/PCGrad
+# route hit an irreducible fit-vs-physics gradient conflict).
+#
+# Fixes the dQ/dSST = +7 W/m2/K feedback defect by putting the CAUSAL derivative
+# into the LABELS instead of fighting them with a penalty. Each epoch, a fraction
+# (--perturb_frac) of training samples become SYNTHETIC perturbed-SST samples:
+#   * SST and SST_prev shifted by dS ~ U(-range, +range)  (dSST_dt input unchanged
+#     -> a SUSTAINED anomaly, matching the coupled warm-drift mode);
+#   * SHFLX/LHFLX targets relabeled by the shr_flux bulk turbulent delta
+#     dSH,dLH = bulk(SST+dS) - bulk(SST) at FIXED boundary-layer atmosphere
+#     (~ -30 W/m2/K over ocean, verified);
+#   * radiation (FSDS/FLDS), stress, QFLX, PRECT held -> teaches dR/dSST = 0,
+#     which kills the learned warm-SST<->more-FLDS leak (the +5.6 term).
+# Absolute fluxes stay CREDIT-accurate (delta added to the real target); only the
+# SST-sensitivity is bent to physics. Trained with plain MSE -> the fit and the
+# physics AGREE (no penalty, no gradient conflict). NO CREDIT ML: the flux engine
+# is the user's UNet; the relabeling target is deterministic CESM bulk physics.
+#
+# WHY THIS ROUTE: the penalty route was exhausted at both lambda extremes
+# (attempt 1 lambda=0.2 blew the fit to val 0.41; attempt 2 lambda=0.03 didn't
+# move sturb) and PCGrad (attempt 3) moved the physics (sturb v, srad 0.077->0.009)
+# but the fit still degraded (val 0.14->0.26) with conflict~0.85 -> the labels
+# encode +7 too strongly for a fine-tune to reconcile. The data route removes the
+# conflict at its SOURCE by making the labels self-consistent along the SST axis.
+#
+# Warm-start: v14 e37preview best_model.pt. Fresh out_dir (recomputes the
+# normalizer, identical stats; avoids resuming the deleted penalty checkpoints).
+# GATE (not val-MSE): offline dQ/dSST re-audit must swing +7 -> -10..-25, then a
+# coupled 1-yr run toward Dec-1980 truth 18.69. Tune --perturb_frac if the audit
+# shows the causal push is too weak (raise) or the fit degraded too far (lower).
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_atmin_e37preview/best_model.pt
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (silent CPU fallback wastes the walltime).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_perturb \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm_in \
+    --sst_perturb \
+    --perturb_frac  0.5 \
+    --perturb_range 2.0 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-perturb \
+    --wandb_project couple-unet
+
+echo "v15 perturb (data route) training session done at $(date)"

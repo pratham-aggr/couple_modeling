@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -N unified_fw
+#PBS -A UCSD0085
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=32:ngpus=2:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unified_flux_wind_rollout.log
+#PBS -j oe
+
+# =============================================================================
+# UNIFIED autoregressive FLUX+WIND model (2 x A100), tracked on wandb.
+#
+# The WORKING MEMO flux net (n_in=11, winds AS INPUT -> 8 fluxes, +0.002 K coupled)
+# extended to ALSO output the next-step BL winds (Ubot..PS @t+1), trained on the
+# rollout it will actually run (BPTT K2->8) so it can drive itself past 2014.
+#
+# Fixes what the two priors could not:
+#   * kvjcofin: predicted winds+fluxes from OCEAN-ONLY inputs (no wind input) +
+#     one-shot -> lost flux quality, died coupled.
+#   * standalone emulator: separate net -> variance-collapsed weak winds -> drift.
+# This keeps the winning wind-INPUT structure AND trains autoregressively.
+#
+# First run: var_loss_weight 0 = SAME objective as the working memo (pure MSE),
+# to cleanly test whether wind-input + autoregression + multitask alone fixes it.
+# If |wind|@120 collapses (<7 vs truth 7.3), rerun with --var_loss_weight 0.1.
+#
+# Isolated out_dir: output/output_unified_flux_wind (touches nothing else).
+# Submit:  qsub scripts/submit_unified_flux_wind_rollout.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -c "import torch; n=torch.cuda.device_count(); assert n>=2, f'need 2 GPUs, got {n}'; print('GPUs:', [torch.cuda.get_device_name(i) for i in range(n)])"
+
+python -u train_unified_flux_wind_rollout.py \
+    --out_dir     output/output_unified_flux_wind \
+    --train_years 1980-2010 \
+    --val_years   2011-2012 \
+    --test_years  2013-2014 \
+    --rollout        8 \
+    --rollout_start  2 \
+    --rollout_ramp_epochs 8 \
+    --stride      2 \
+    --epochs      40 \
+    --batch       12 \
+    --base        64 \
+    --lr          3e-4 \
+    --dropout     0.1 \
+    --ema \
+    --probe_steps 120 \
+    --var_loss_weight 0.0 \
+    --wandb_name    mem24h-unified-flux-wind \
+    --wandb_project couple-unet
+
+echo "unified flux+wind training done $(date)"

@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N blstate_gx1v7
+#PBS -A UCSD0085
+#PBS -q main
+#PBS -l select=1:ncpus=128:mpiprocs=1:mem=235GB
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/
+# Submit: qsub -q main@desched1 <this file>   (no -V: Casper module contamination)
+
+# Build X_atm.npy (50960, 5, 384, 320) — Ubot/Vbot/Tbot/Qbot/PS at t_now on the
+# native gx1v7 grid, appended to couple_cache_gx1v7_mem24h for the v13 retrain
+# (train_unet.py --with_atm_in). Remap transform verified bit-identical to the
+# training zarrs (SOLIN/SST spot check vs zarr_gx1v7_1985, 2026-07-14).
+
+set -euo pipefail
+echo "started $(date) on $(hostname)"
+
+ATM_PY=/glade/work/praggarwal/conda-envs/atm/bin/python
+cd /glade/u/home/praggarwal/couple
+
+"$ATM_PY" -u add_blstate_to_gx1v7_cache.py --workers 8
+
+# Post-build sanity: shape, finiteness, physically plausible channel stats.
+"$ATM_PY" - <<'EOF'
+import numpy as np, json
+cache = "/glade/work/praggarwal/couple_cache_gx1v7_mem24h"
+Xa = np.load(f"{cache}/X_atm.npy", mmap_mode="r")
+print("shape", Xa.shape, Xa.dtype)
+idx = np.linspace(0, Xa.shape[0]-1, 40).astype(int)
+sub = Xa[idx]
+assert np.isfinite(sub).all(), "non-finite values in X_atm sample"
+names = ["Ubot","Vbot","Tbot","Qbot","PS"]
+for c, nme in enumerate(names):
+    print(f"{nme:5s} mean {sub[:,c].mean():12.4f} std {sub[:,c].std():12.4f} "
+          f"min {sub[:,c].min():12.4f} max {sub[:,c].max():12.4f}")
+# Rough physical ranges
+assert 200 < sub[:,2].mean() < 320, "Tbot out of range"
+assert 5e4 < sub[:,4].mean() < 1.1e5, "PS out of range"
+print("sanity OK")
+EOF
+
+echo "done $(date)"

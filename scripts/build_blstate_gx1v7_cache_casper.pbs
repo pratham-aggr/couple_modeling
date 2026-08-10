@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -N blstate_gx1v7_c
+#PBS -A UCSD0044
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=120GB
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/
+
+# Casper hedge for scripts/build_blstate_gx1v7_cache.pbs (Derecho job queued
+# behind a scheduler drain 2026-07-14). The builder takes an O_EXCL lock on
+# X_atm.npy.lock, so whichever of the two jobs starts first builds; the other
+# exits 0 immediately. Same verification block as the Derecho script.
+
+set -euo pipefail
+echo "started $(date) on $(hostname)"
+
+ATM_PY=/glade/work/praggarwal/conda-envs/atm/bin/python
+cd /glade/u/home/praggarwal/couple
+
+"$ATM_PY" -u add_blstate_to_gx1v7_cache.py --workers 8
+
+# Post-build sanity: only if THIS job took the lock (otherwise the other job may
+# still be mid-write and sampling the memmap would false-fail).
+if grep -q "$(hostname)" /glade/work/praggarwal/couple_cache_gx1v7_mem24h/X_atm.npy.lock 2>/dev/null; then
+"$ATM_PY" - <<'EOF'
+import numpy as np
+cache = "/glade/work/praggarwal/couple_cache_gx1v7_mem24h"
+Xa = np.load(f"{cache}/X_atm.npy", mmap_mode="r")
+print("shape", Xa.shape, Xa.dtype)
+idx = np.linspace(0, Xa.shape[0]-1, 40).astype(int)
+sub = Xa[idx]
+assert np.isfinite(sub).all(), "non-finite values in X_atm sample"
+names = ["Ubot","Vbot","Tbot","Qbot","PS"]
+for c, nme in enumerate(names):
+    print(f"{nme:5s} mean {sub[:,c].mean():12.4f} std {sub[:,c].std():12.4f} "
+          f"min {sub[:,c].min():12.4f} max {sub[:,c].max():12.4f}")
+assert 200 < sub[:,2].mean() < 320, "Tbot out of range"
+assert 5e4 < sub[:,4].mean() < 1.1e5, "PS out of range"
+print("sanity OK")
+EOF
+fi
+
+echo "done $(date)"

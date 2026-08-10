@@ -2,6 +2,8 @@
 
 A UNet that predicts atmosphere-to-ocean surface fluxes directly from ocean state, bypassing the CPL7 bulk formula. Trained on 35 years of CESM2 output at 6-hourly resolution.
 
+> **Standalone MEMO+POP2 coupling (v8, 5 stable years):** see [README_standalone_v8.md](README_standalone_v8.md) for the fix stack that made it work and how the ML CICE emulator is coupled.
+
 ## Task
 
 | | |

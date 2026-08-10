@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -N dqdsst_audit
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=01:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/dqdsst_audit.log
+#PBS -j oe
+
+# =============================================================================
+# Coupled-deploy GATE for the CRPS Stage-2 checkpoint (output_unet_gx1v7_sensreg_
+# crps): CRPS fine-tuning dropped the SST-sensitivity regularizer, so confirm the
+# physical damping dQnet/dSST (~ -30..-45 W/m2/K turbulent-inclusive) SURVIVED and
+# did NOT regress toward the +7 W/m2/K correlation defect. Compares crps vs the
+# sensreg production checkpoint vs the shr_flux bulk-physics target on the same
+# 2013-2014 test samples. Writes dqdsst_audit.json.
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -euo pipefail
+echo "PBS start $(date) node=$(hostname) jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+python -u audit_dqdsst.py --n 320 --dS 0.5
+echo "dQ/dSST audit done $(date)"

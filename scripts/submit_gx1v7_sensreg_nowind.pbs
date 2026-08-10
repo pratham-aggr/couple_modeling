@@ -1,0 +1,91 @@
+#!/bin/bash
+#PBS -N gx1_sensreg_nowind
+#PBS -A NAML0001
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_sensreg_nowind.log
+#PBS -j oe
+
+# =============================================================================
+# WIND-FREE v15 ("sensreg_nowind") — PATHWAY 1 toward a 500-yr free-running
+# product that needs NO prescribed boundary-layer winds.
+#
+# The deployed v15 sensreg flux net is n_in=11: it consumes 5 prescribed BL-atm
+# channels (Ubot/Vbot/Tbot/Qbot/PS) that only exist for 1980-2014 (~35 yr). A
+# 500-yr run cannot feed those. The autoregressive atm emulator that would
+# supply them past 2014 blew up (winds -> 20.6 m/s in 30 days -> POP k.e.>100,
+# job 6969200). So instead we drop the winds from the flux net ENTIRELY:
+#
+#   n_in=6: SST, ICEFRAC, SOLIN, SST_prev, ICEFRAC_prev, dSST_dt
+#           (all prognostic or astronomical -> zero external-data limit)
+#
+# The one thing the winds bought that we must NOT lose is the sensreg dQ/dSST
+# fix. --sens_atm_offline keeps the SST-sensitivity regularizer's bulk-physics
+# target (computed per cell from that cell's real BL atm) while NOT feeding the
+# atm to the net. So the wind-free net still learns the physical turbulent
+# damping (-30..-45 W/m2/K) instead of the +7 correlation defect, WITHOUT ever
+# needing the atm at inference.
+#
+# Warm-start: the existing n_in=6 flux net (output_unet_gx1v7, identical n_out=8
+# / output_vars, same architecture -> strict state_dict load). Fresh optimizer
+# at the sensreg fine-tune LR; PCGrad gradient surgery protects the fit while the
+# regularizer bends the physics (same recipe as submit_gx1v7_sensreg.pbs).
+#
+# GATE (same as sensreg): NOT val-MSE. The real gate is the offline dQ/dSST audit
+# (target -10..-25 W/m2/K, was +7) then a 1-yr -> 5-yr coupled drift test with NO
+# --with_atm_in, scored vs the prescribed-atm v15 clean year (Jan->Dec +0.002 K).
+#
+# Safe to resubmit: --resume continues from checkpoint.pt once one exists.
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+# FROM SCRATCH (user, 2026-08-01): NO warm-start. Random init so the wind-free net
+# carries none of the old n_in=6 checkpoint's +7 W/m2/K feedback baggage — a clean,
+# uncontaminated test of whether a wind-free flux net can be good. PCGrad keeps the
+# MSE fit at full strength while the sensreg regularizer bends the SST-sensitivity,
+# so training the fit + physics together from random init is well-posed.
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (casper41 "CUDA unknown error" -> silent CPU).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_sensreg_nowind \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --sens_atm_offline \
+    --sst_sens_reg \
+    --sens_lambda     0.2 \
+    --sens_lambda_rad 0.1 \
+    --sens_delta      0.5 \
+    --lr            2e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    150 \
+    --patience      50 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-sensreg-nowind \
+    --wandb_project couple-unet
+
+echo "wind-free sensreg training session done at $(date)"
