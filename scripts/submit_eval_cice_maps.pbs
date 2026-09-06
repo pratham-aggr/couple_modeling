@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N eval_cice_maps
+#PBS -A UCSD0044
+#PBS -q casper
+#PBS -l select=1:ncpus=16:mem=64GB
+#PBS -l walltime=00:30:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/eval_cice_maps.log
+#PBS -j oe
+
+# =============================================================================
+# Test-period truth/predicted/error spatial maps (appendix) for the DEPLOYED
+# ML CICE sea-ice emulator, full held-out test set. Read-only offline eval.
+# See eval_cice_maps.py docstring for details.
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -uo pipefail
+echo "PBS start $(date) node=$(hostname) jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -u eval_cice_maps.py --bs 32
+RC=$?
+echo "eval done $(date) rc=$RC"

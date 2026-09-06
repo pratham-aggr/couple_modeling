@@ -1,0 +1,39 @@
+{
+  "total": {
+    "mean_ms": 167.50688073394497,
+    "median_ms": 160.0,
+    "p5_ms": 140.0,
+    "p95_ms": 210.0
+  },
+  "prep": {
+    "mean_ms": 8.34151376146789,
+    "median_ms": 8.0,
+    "p5_ms": 8.0,
+    "p95_ms": 10.0
+  },
+  "infer": {
+    "mean_ms": 10.318577981651377,
+    "median_ms": 10.0,
+    "p5_ms": 10.0,
+    "p95_ms": 12.0
+  },
+  "post": {
+    "mean_ms": 85.4809633027523,
+    "median_ms": 86.0,
+    "p5_ms": 83.0,
+    "p95_ms": 88.0
+  },
+  "write": {
+    "mean_ms": 63.8197247706422,
+    "median_ms": 56.0,
+    "p5_ms": 36.0,
+    "p95_ms": 107.0
+  },
+  "step_sum": {
+    "mean_ms": 167.96077981651376,
+    "median_ms": 160.0
+  },
+  "n_steps_analysed": 4360,
+  "n_steps_parsed": 4380,
+  "implied_atm_only_sypd_compute": 352.33274253923463
+}

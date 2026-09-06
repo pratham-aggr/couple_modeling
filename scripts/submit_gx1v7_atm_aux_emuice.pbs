@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -N gx1_aux_emuice
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atm_aux_emuice.log
+#PBS -j oe
+
+# =============================================================================
+# EXPERIMENT (user 2026-08-16): "retrain the flux wind model on emulated icefrac
+# just to see what happens" -- a DATA POINT on the train/serve ICEFRAC mismatch.
+#
+# IDENTICAL to the pz220f0b from-scratch recipe (submit_gx1v7_atm_aux_scratch.pbs:
+# n_in=6 ocean-only -> n_out=13, --with_atm, base 64, MSE, 80 ep, temporal split)
+# EXCEPT the training cache: couple_cache_gx1v7_emuice, where the ICEFRAC (ch1) and
+# ICEFRAC_prev (ch4) INPUT channels are the CICE emulator's own aice (built by
+# gen_emulated_icefrac.py + build_emuice_cache.py) instead of the real CREDIT
+# ICEFRAC.  So the flux net LEARNS on the same (emulated) ice it will see at runtime
+# with --ice_input_from_emu -- eliminating the exposure-bias mismatch, at the cost
+# of welding the flux net to this CICE emulator.  From SCRATCH (user's choice) so it
+# is a true "trained on emulated ice" net, not a fine-tune.
+#
+# Normalizer is recomputed from the emu-swapped X (temporal split -> no cached-norm
+# load), so the emu-aice channel is normalized by its OWN stats (no confound).
+# Isolated out_dir: output_unet_gx1v7_atm_aux_emuice (pz220f0b untouched).
+# GATE: offline flux R^2 (esp. ice zones) vs pz220f0b, then a coupled 1-yr run with
+# --ice_input_from_emu vs the +0.38 K emuice-input baseline (job 7120094).
+# Submit: qsub scripts/submit_gx1v7_atm_aux_emuice.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux_emuice \
+    --cache_dir     /glade/derecho/scratch/praggarwal/couple_cache_gx1v7_emuice \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --lr            3e-4 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    gx1v7-atm-aux-emuice \
+    --wandb_project couple-unet
+
+echo "gx1v7 emulated-ICEFRAC from-scratch training done at $(date)"

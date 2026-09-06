@@ -1,0 +1,106 @@
+#!/bin/bash
+#PBS -N gx1_sensreg_atmin
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=128GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_sensreg_atmin.log
+#PBS -j oe
+
+# NOTE (2026-08-11): FRESH re-run of atmin's sensreg fine-tune into an ISOLATED
+# out_dir (output_unet_gx1v7_sensreg_atmin) + fresh wandb, so the DEPLOYED
+# checkpoint (output/output_unet_gx1v7_sensreg) is NOT touched/resumed. Same
+# init_weights (atmin), same PCGrad recipe as the deployed run.
+
+# =============================================================================
+# v15 "sensreg" — LEVER 2: fix the dQ/dSST = +7 W/m2/K feedback defect.
+#
+# Fine-tunes the v14 "atmin" UNet (lever 1: BL-state inputs, tau magnitude fixed)
+# with an SST-sensitivity regularizer that forces the net's CAUSAL flux response
+# to SST to match air-sea bulk physics instead of the learned correlation:
+#   loss = MSE(pred, truth)                                    # empirical fit
+#        + lambda_turb * || d(SHFLX+LHFLX)/dSST  - bulk_turb_damping ||^2
+#        + lambda_rad  * || d(FSDS+FLDS)/dSST    - 0 ||^2       # kill FLDS leak
+# Target = shr_flux (bulk_flux.py) turbulent SST-derivative, computed per grid
+# cell from that cell's own prescribed BL atmosphere (~ -30..-45 W/m2/K over
+# ocean). Derivative = centered +-0.5 K finite difference through the net, BL
+# atm channels held fixed, BN in eval (deploy regime). NO CREDIT ML: the flux
+# engine is the user's UNet; the target is deterministic CESM bulk physics.
+#
+# Also fixes the degenerate dSST_dt normalizer (compute_norm_from_mmap
+# catastrophic cancellation -> x_std=0 -> ~1e8 scaling -> the +700 W/m2/K
+# instant defect that made the runtime dSST clamp load-bearing). A FRESH
+# out_dir forces the corrected normalizer to be recomputed.
+#
+# Warm-start: v14 e37preview best_model.pt (val 0.0505). Fresh optimizer at a
+# reduced fine-tune LR so the sensitivity is bent in without wrecking the fit.
+# Safe to resubmit: --resume continues from checkpoint.pt once one exists (the
+# resume block overrides --init_weights).
+#
+# CALIBRATION HISTORY:
+#  attempt 1 (job 5245737, KILLED): lambda_turb=0.2 lr=2e-4 -> fit BLEW UP (val
+#    0.05->0.33 in ONE epoch, rising) though sturb DID fall 0.20->0.06.
+#  attempt 2 (job 5250912, KILLED): lambda_turb=0.03 lr=4e-5 -> gentle, but sturb
+#    ROSE 0.36->0.38 (physics didn't move) while val still crept up. Pure lambda
+#    tuning is exhausted at BOTH ends: the labels encode +7 W/m2/K, so the raw
+#    sens gradient collides head-on with the MSE gradient — turn it up and the fit
+#    dies, turn it down and the physics won't budge.
+#
+# attempt 3 = PCGrad GRADIENT SURGERY (user-selected): the MSE and sensitivity
+#   gradients are computed on independent forward graphs and combined by removing
+#   the projection of g_sens onto g_mse ONLY when they conflict (g_sens.g_mse<0).
+#   The MSE gradient is always kept at full strength (fit protected structurally),
+#   so lambda can go back up to actually bend the physics via the fit's null-space.
+#   Restored lambda_turb=0.2 lambda_rad=0.1, lr=1e-4. Watch [.. conflict=..]: if
+#   conflict~1.0 AND sturb still won't fall, the null-space is too small and NO
+#   fine-tune can fix this (-> the SST-perturbed-data route is the fallback). The
+#   REAL gate remains the offline dQ/dSST audit + coupled drift, not val-MSE.
+# =============================================================================
+
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_atmin_e37preview/best_model.pt
+
+set -euo pipefail
+echo "PBS job started: $(date), node=$(hostname), jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (casper41 "CUDA unknown error" -> silent CPU).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_sensreg_atmin \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm_in \
+    --sst_sens_reg \
+    --sens_lambda     0.2 \
+    --sens_lambda_rad 0.1 \
+    --sens_delta      0.5 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    mem24h-gx1v7-sensreg-atmin \
+    --wandb_project couple-unet
+
+echo "v15 sensreg training session done at $(date)"

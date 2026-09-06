@@ -1,0 +1,217 @@
+================================================================================
+ MEMO: pz220f0b (UNFINETUNED) + interactive ML-CICE, coupled to POP2 (gx1v7)
+ job stream: 7239950 -> ... -> 7244332  (run_pop_diagfw_iceloop_chain_256.pbs)
+================================================================================
+
+ *** DEFAULT WORKING MODEL, as of 2026-08-25 ***
+ Unless a message explicitly says otherwise, "the model" / "our run" refers
+ to THIS configuration: unfinetuned pz220f0b flux U-Net + interactive
+ ML-CICE + POP2, self-chaining, no target-year cap. Currently 881 months
+ (73.4 simulated years) complete, latest month 2053-05, still actively
+ running (job 7244332 at time of writing). No other checkpoint (sensreg),
+ no debias correction, no wind-generator/autoregressive-wind variant is
+ the default unless a message names it specifically.
+
+  Two independently-trained CNNs replace CESM's atmosphere (CAM) entirely.
+  No CPL7 coupler is used: POP2 <-> Python server exchange NetCDF files
+  directly ("no-coupler" / cpl_none path). Everything below runs on POP's
+  NATIVE gx1v7 tripole grid (nj=384, ni=320) -- no CAM<->ocean regridding
+  anywhere in this configuration ( --grid gx1v7 --arch gx1v7_native ).
+
+  Coupling cadence: every 6 simulated hours (4 steps/day).
+  ML-CICE cadence:  every simulated month (autoregressive, ramped).
+
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                    POP2 OCEAN MODEL  (Fortran, 256 MPI ranks)        │
+  │   gx1v7 tripole grid, 384(nj) x 320(ni), forcing_memo_mod.F90        │
+  │                                                                      │
+  │   prognostic: T,S (3-D), U,V barotropic+baroclinic, sea-surface ht   │
+  │   reads IFRAC from server -> OCN_WGT=(1-IFRAC) SST/SSS restoring     │
+  └───────────────────────┬───────────────────────────▲──────────────────┘
+                          │ writes                     │ reads
+                 memo_sst_in.nc                memo_cam_out.nc
+                 {SST(nj,ni), aice(nj,ni)*      {taux,tauy,shflx,lhflx,
+                  *only if ice_input_from_ocn}   qflx,fsds,flds,prect,
+                                                  icefrac}  (nj,ni) each
+                          │                             ▲
+                          ▼                             │
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║               model_server.py  (Python, 1 GPU process)               ║
+  ║  polls memo_sst_in.nc -> builds inputs -> two CNN forward passes  ║
+  ║  -> unit convert -> ice-couple -> writes memo_cam_out.nc -> repeat    ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+
+  ────────────────────────── (a) INPUT ASSEMBLY ──────────────────────────
+
+    SST(t) [gx1v7,degC] --(+273.15)--> SST_K(t)
+                                          │
+    24h MEMORY RING BUFFER (4 x 6-hr steps = 1 day lag, cold-start=persist):
+      SST_prev  = SST_K(t-24h)
+      ICEFRAC_prev = ICEFRAC(t-24h)
+      dSST_dt   = (SST_K(t) - SST_prev) / 86400s          [K/s]
+                  (--dsst_cap 0 in this run: NO clamp on this feedback term)
+
+    ICEFRAC(t) = cice.aice  <-- fed back from the ML-CICE emulator itself
+                 (--ice_input_from_emu: flux-net sees the SAME ice the
+                  ocean is actually getting, not a prescribed climatology)
+
+    SOLIN(t)   = analytic top-of-atmosphere insolation, cyclic 1-yr
+                 forcing file, remapped CAM-grid -> gx1v7 (same transform
+                 used at training time)
+
+    ┌─────────────────────── FLUX-NET INPUT TENSOR ───────────────────────┐
+    │   x = stack[ SST, ICEFRAC, SOLIN, SST_prev, ICEFRAC_prev, dSST_dt ] │
+    │       shape (6, 384, 320)   ->  normalize (x-mean)/std              │
+    └───────────────────────────────────────────────────────────────────┘
+
+  ─────────────────── (b) FLUX U-NET  "pz220f0b" (UNFINETUNED) ───────────
+
+    checkpoint: output/output_unet_gx1v7_atm_aux/best_model.pt
+    ** base pz220f0b weights -- the dQ/dSST "sensreg" feedback fine-tune
+       was NOT applied to this checkpoint (per this session's directive:
+       use the unfinetuned model unless told otherwise) **
+    n_in=6  n_out=13   base=64 channels   5-level encoder/decoder UNet
+    (architecture identical to climatebench unet_simple.py; circular
+     padding in longitude, replicate padding in latitude -> tripole seam
+     and dateline wrap handled correctly)
+
+     input (6,384,320)
+       │
+       ▼
+     init_conv 1x1  (6 -> 64)  ────────────────────────────────────────┐
+       │                                                                \
+       ▼ ENCODER (stride-2 conv, CircPad, BatchNorm, LeakyReLU 0.2)      \  saved
+     enc1:  64 ->  128   (192,160)  ──────────skip─────────────────┐      \ as
+     enc2: 128 ->  128   ( 96, 80)  ──────────skip───────────────┐ │       \ "r"
+     enc3: 128 ->  256   ( 48, 40)  ──────────skip─────────────┐ │ │        \ for
+     enc4: 256 ->  512   ( 24, 20)  ──────────skip───────────┐ │ │ │         \ the
+     enc5: 512 ->  512   ( 12, 10)  [bottleneck, k=2,pad=0]   │ │ │ │          \ final
+       │                                                      │ │ │ │           \ concat
+       ▼ DECODER (bilinear upsample, CircPad, conv, BatchNorm, ReLU)             |
+     dec1:  512 ->  512        (24,20)                         │ │ │ │           |
+           concat(dec1, enc4-skip) -> 1024ch  <────────────────┘ │ │ │           |
+     dec2: 1024 ->  256        (48,40)                            │ │ │           |
+           concat(dec2, enc3-skip) ->  512ch  <──────────────────────┘ │ │           |
+     dec3:  512 ->  128        (96,80)                                  │ │           |
+           concat(dec3, enc2-skip) ->  256ch  <──────────────────────────┘ │           |
+     dec4:  256 ->  128       (192,160)                                     │           |
+           concat(dec4, enc1-skip) ->  256ch  <──────────────────────────────┘           |
+     dec5:  256 ->   64       (384,320)                                                  |
+       │                                                                                 |
+       ▼  concat(dec5_out, init_conv_residual "r") -> 128ch  <───────────────────────────┘
+     head: 1x1 conv  128 -> 13    (13, 384, 320)
+       │
+       ▼ de-normalize (y*std + mean), split 13 channels:
+     ┌──────────────────────────────┬───────────────────────────────┐
+     │ USED (fed to ocean, 8ch):    │ DIAGNOSED ONLY (5ch, LOGGED    │
+     │  0 TAUX   [N/m2]             │  BUT NEVER FED BACK -- this    │
+     │  1 TAUY   [N/m2]             │  net's winds are NOT auto-     │
+     │  2 SHFLX  [J/m2/6h]->W/m2    │  regressive):                  │
+     │  3 LHFLX  [J/m2/6h]->W/m2    │  8  Ubot  [m/s]                │
+     │  4 QFLX   [m/6h]->kg/m2/s    │  9  Vbot  [m/s]                │
+     │  5 FSDS_J [J/m2/6h]->W/m2 dn │  10 Tbot  [K]                  │
+     │  6 FLDS_J [J/m2/6h]->W/m2 dn │  11 Qbot  [kg/kg]               │
+     │  7 PRECT  [m/6h]->kg/m2/s    │  12 PS    [Pa]                 │
+     └──────────────────────────────┴───────────────────────────────┘
+
+  ──────────────────── (c) SERVING-TIME POST-PROCESSING ──────────────────
+
+    TAUX,TAUY  --(--tau_sign_fix: negate)-->  into-ocean sign convention
+               (raw UNet output is CAM atm-drag sign; POP applies fields
+                unnegated, so this flip is required -- validated 2026-07-12)
+
+    FSDS  --(--ocn_albedo)--> FSDS *= (1 - albedo(cosz))
+               analytic flux-weighted Briegleb direct-beam ocean albedo,
+               cosz from exact astronomy (declination + hour angle),
+               integrated across the 6h window. Converts raw downwelling
+               SW into net-of-albedo SW (POP's forcing_memo_mod contract).
+
+    [flux envelope clip: shflx/lhflx/fsds/flds clamped to the 1980
+     CREDIT-truth min/max, rounded outward -- tail-only, ~0.15% of cells]
+
+    ** NOT applied in this run: --qnet_debias / --qnet_debias_lh (the
+       regional Qnet bias correction built+validated for the sensreg
+       checkpoint). Offline audit of THIS unfinetuned checkpoint found
+       its OWN static bias negligible (Global +0.6 W/m2) -- see note **
+
+    ** NOT applied in this run: --dsst_cap / --tau_cap (both =0, i.e.
+       disabled) -- no safety clamp on the dSST/dt feedback input or on
+       extreme wind-stress cells. **
+
+  ───────────── (d) ML-CICE  (interactive sea ice, separate network) ─────
+
+    checkpoint: output/output_cice_solin/best_model.pt
+    n_in=6  n_out=6   base=64   SAME UNet class as the flux net, on the
+    SAME gx1v7 grid (384,320) -- fully autoregressive, MONTHLY cadence
+    (stepped once per simulated month; the coupling loop above runs at
+     6h resolution, so the ML-CICE state is HELD/RAMPED between steps)
+
+      input (6,384,320):
+        SST(t) [live POP SST]             ┐
+        SOLIN(t)                          │  6-channel stack
+        aice_prev, hi_prev,               │  (own previous month's
+        uvel_prev, vvel_prev              ┘   APPLIED state, autoregressive)
+           │
+           ▼  [same 5-level UNet, base=64, encoder/decoder/skips as above]
+      output (6,384,320): aice, hi, uvel, vvel, strocnx, strocny
+           │
+           ▼  RESIDUAL heads: aice = aice_prev + Δaice (clip 0..1)
+                              hi   = hi_prev   + Δhi   (clip >=0)
+              uvel,vvel,strocnx,strocny predicted ABSOLUTE
+
+      MID-MONTH SCHEDULING + GLIDE (prevents 1-step aice/hi jumps):
+        at mid-month(m): predict mean(m+1) from mean(m) state
+        applied field glides LINEARLY from mid-month(m) -> mid-month(m+1)
+        melt-heat sink recomputed EVERY 6h step from the *applied*
+        (glided) hi change:  melth = rho_ice * L_fusion * d(hi_applied)/dt
+                              (capped +-200 W/m2, folded into SHFLX)
+
+  ─────────────── (e) ICE<->OCEAN FLUX COUPLING (cice_coupler.apply) ─────
+
+    f  = clip(aice_applied, 0, 1)
+    virt (--ice_virtual, skin-ice floor): f = max(f, 1 - clip((SST+1.8)/0.3,0,1))
+         (treats near-freezing water as ice-covered even if the monthly-
+          anchored emulator lags -- prevents a runaway polynya/frazil
+          feedback between monthly ML-CICE updates)
+    ow = 1 - f                                          (open-water frac)
+
+      taux_o  = ow*taux        + f*strocnx    (ice->ocean stress blend)
+      tauy_o  = ow*tauy        + f*strocny
+      shflx_o = ow*shflx       + melth         (melt heat folded in)
+      lhflx_o = ow*lhflx                       (evap masked under ice)
+      qflx_o  = ow*qflx
+      fsds_o  = ow*fsds                        (SW zeroed under full ice)
+      flds_o  = ow*flds + f*(sigma*SST_K^4)    (blackbody blend, NOT
+                zero -- avoids ~-300 W/m2 unopposed LWUP under high aice)
+      prect_o = prect                          (unweighted, v1 scope)
+      IFRAC_out = f              -> written to POP for SST/SSS restoring
+
+    ALL fields above are +INTO-OCEAN, coupler-convention (verified against
+    write_cam_gx1v7()'s own contract: shflx/lhflx POSITIVE=INTO OCEAN).
+
+  ───────────────────────── (f) WRITE + LOOP ─────────────────────────────
+
+    write_cam_gx1v7(memo_cam_out.nc, taux_o..prect_o, icefrac=IFRAC_out)
+    signal POP (done.flag) -> POP advances one 6h coupling step -> writes
+    new memo_sst_in.nc -> back to (a).  No CPL7, no atmosphere model, no
+    remap anywhere in this loop.
+
+================================================================================
+ SUMMARY OF WHAT MAKES THIS "unft + interactive ice" CONFIG DISTINCT
+================================================================================
+  * TWO neural nets total (flux U-Net + ML-CICE), zero classical bulk-flux
+    or atmosphere-model code in the loop.
+  * Flux U-Net winds are DIAGNOSED, not autoregressive (5 of 13 output
+    channels are logged for analysis only, never fed back) -- this is
+    what "pz220f0b / diag_flux_wind" means architecturally.
+  * Flux U-Net checkpoint is the UNFINETUNED base weights (no dQ/dSST
+    sensreg correction, no regional qnet_debias correction).
+  * ML-CICE is fully autoregressive and interactive (closes the ice-SST
+    feedback loop; --ice_input_from_emu also closes it on the flux-net's
+    OWN ice input channel).
+  * Safety clamps --dsst_cap/--tau_cap are OFF in this run.
+  * Grid: native gx1v7 (384x320) end-to-end, no CAM-grid detour.
+  * Coupling: file-based (memo_sst_in.nc / memo_cam_out.nc), 6h cadence;
+    ML-CICE internally steps monthly with a mid-month-to-mid-month glide.
+================================================================================

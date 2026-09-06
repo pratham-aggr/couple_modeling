@@ -1,0 +1,35 @@
+FASST FULL COUPLED THROUGHPUT BENCHMARK -- run 1
+timestamp        : 2026-08-28T02:08:36-06:00
+pbs jobid        : 7258418.desched1 (POP half; server half is a paired job)
+exit code (POP)  : 0
+
+-- hardware --
+  layout         : 2 CPU nodes (256 POP ranks, 128/node) + 1 dedicated A100 (server)
+  CPU nodes      : dec2310 dec2321 
+  GPU model      : NVIDIA A100-SXM4-40GB
+  PBS packaging  : two UNIFORM jobs sharing a rundir (het jobs do not
+                   schedule on this system); hardware is exactly as specified
+  production job :  on   (node-disjoint, verified)
+
+-- configuration (identical to production pz220f0b) --
+  memo config    : /glade/u/home/praggarwal/couple/camulator_ud/climate/memo_config_gx1v7_diagfw.yml
+  checkpoint     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+  grid           : gx1v7 384x320 (native, no remap)
+  atm exchange   : 6-hourly | ice update: monthly | POP dt: 30 min
+  serving flags  : --diag_flux_wind --tau_sign_fix --dsst_cap 0 --tau_cap 0
+                   --flux_ramp_days 0 --ocn_albedo --ice_couple --ice_virtual
+                   --ice_input_from_emu --ice_ramp_days 20
+  I/O included   : monthly POP history + monthly restarts (production, UNCHANGED)
+  git commit     : 158ee0e15518bab6565683ef435e03a534c3e732
+
+-- timing --
+  simulated years         : 3
+  wall clock (integration): 7283.1 s
+  init/setup (excluded)   : 100.1 s  (wait for paired server job)
+  SYPD                    : 35.589
+  min per sim-year        : 40.46
+  coupling steps (6-h)    : 4380
+  SYPD formula            : 3 / (7283.1/86400)
+
+-- reproduce --
+  BENCH_RUN=1 /glade/u/home/praggarwal/couple/camulator_ud/climate/bench_split_launch.sh

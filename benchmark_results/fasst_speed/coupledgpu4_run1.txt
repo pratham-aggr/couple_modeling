@@ -1,0 +1,40 @@
+FASST FULL COUPLED THROUGHPUT BENCHMARK -- run 1
+timestamp        : 2026-08-27T00:04:27-06:00
+pbs jobid        : 7256129.desched1
+exit code (POP)  : 0
+
+-- hardware --
+  layout         : 4 GPU nodes, 256 POP ranks (64/node), server on mother-node A100 (PRODUCTION SHAPE)
+  CPU hosts      : (all 4 allocated GPU nodes, 64 ranks each)
+  GPU host       : deg0069
+  GPU model      : NVIDIA A100-SXM4-40GB
+  PBS select     : 4:ncpus=64:mpiprocs=64:ngpus=1:mem=200GB
+  production job : 7255561 on deg0018 deg0055 deg0057 deg0059 deg0061  (node-disjoint, verified)
+
+-- configuration (identical to production pz220f0b) --
+  memo config    : /glade/u/home/praggarwal/couple/camulator_ud/climate/memo_config_gx1v7_diagfw.yml
+  model dir      : /glade/u/home/praggarwal/couple/output/output_unet_gx1v7_atm_aux
+  checkpoint     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+  cice ckpt      : output_cice_solin/best_model.pt
+  grid           : gx1v7 384x320 (native, no remap)
+  atm exchange   : 6-hourly
+  ice update     : monthly (autoregressive, mid-month glide)
+  POP timestep   : 30 min (48 steps/day)
+  serving flags  : --diag_flux_wind --tau_sign_fix --dsst_cap 0 --tau_cap 0
+                   --flux_ramp_days 0 --ocn_albedo --ice_couple --ice_virtual
+                   --ice_input_from_emu --ice_ramp_days 20
+  I/O included   : monthly POP history + monthly POP restarts (production setting,
+                   UNCHANGED) + per-step memo_sst_in.nc / memo_cam_out.nc exchange
+  git commit     : 158ee0e15518bab6565683ef435e03a534c3e732
+
+-- timing --
+  simulated years         : 3
+  wall clock (integration): 6927.5 s
+  init/setup (excluded)   : 47.8 s
+  SYPD                    : 37.416
+  min per sim-year        : 38.49
+  coupling steps (6-h)    : 4380
+  SYPD formula            : 3 / (6927.5/86400)
+
+-- reproduce --
+  BENCH_RUN=1 qsub -q main@desched1 -v BENCH_RUN /glade/u/home/praggarwal/couple/camulator_ud/climate/bench_fasst_coupled_gpu4_3yr.pbs

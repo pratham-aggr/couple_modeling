@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -N bench_pz220
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB:gpu_type=a100
+#PBS -l walltime=00:20:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/bench_pz220f0b.log
+#PBS -j oe
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+SP=/glade/derecho/scratch/praggarwal/tmp/claude-50400/-glade-u-home-praggarwal-couple/b5467ce7-e6b0-4dcf-bde2-45654943b67e/scratchpad
+python -u ${SP}/bench_pz220f0b.py
+echo "bench done $(date)"

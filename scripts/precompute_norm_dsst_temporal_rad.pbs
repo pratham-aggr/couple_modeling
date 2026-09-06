@@ -20,7 +20,7 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 cd ${COUPLE_DIR}
 
 echo "Precomputing 7-channel normaliser (5 fluxes + FSDS_J/FLDS_J, dSST/dt) from 1980-2010 ..."
-python -u precompute_norm.py \
+python -u preprocessing/precompute_norm.py \
     --cache_dir      /glade/work/praggarwal/couple_cache_mem24h \
     --out_dir        ${COUPLE_DIR}/output/output_unet_mem24h_dsst_temporal_rad \
     --zarr_glob      "${ZARR_GLOB}" \

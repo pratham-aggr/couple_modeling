@@ -16,6 +16,6 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 
 cd /glade/u/home/praggarwal/couple
 
-python -u preprocess_data.py --memory --memory_lag 48
+python -u preprocessing/preprocess_data.py --memory --memory_lag 48
 
 echo "Done: $(date)"

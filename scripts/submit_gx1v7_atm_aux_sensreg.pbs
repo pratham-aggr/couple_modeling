@@ -1,0 +1,96 @@
+#!/bin/bash
+#PBS -N gx1_aux_sens
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atm_aux_sensreg.log
+#PBS -j oe
+
+# =============================================================================
+# SENSREG FINE-TUNE of pz220f0b (user 2026-08-13: "start a casper model finetune
+# of pz220f0b").  pz220f0b = output_unet_gx1v7_atm_aux: the from-scratch,
+# gx1v7-NATIVE (384x320), NON-autoregressive flux+wind net (n_in=6 ocean-only ->
+# n_out=13 = 8 flux + 5 BL winds), trained MSE-only to ep80 (val 0.168).
+#
+# The MSE base has NO dQ/dSST feedback fix (+7 W/m2/K = wrong sign, runaway path
+# by construction).  It nonetheless SURVIVED a coupled year on POP (+0.484 K,
+# bounded/seasonal, beats the +0.58 clim floor -- job 7103668) BUT ran away
+# +8.28 K on FESOM-JAX (memo pz220f0b-fesom-runaway) because FESOM's Southern
+# Ocean amplifies the warm bias far more.  This fine-tune adds LEVER 2 (the
+# deployed v15 sensreg cure) to fix the feedback at its source:
+#   loss = MSE(pred, truth)
+#        + sens_lambda     * || d(SHFLX+LHFLX)/dSST - bulk_turb_damping ||^2
+#        + sens_lambda_rad * || d(FSDS+FLDS)/dSST   - 0 ||^2   # kill the FLDS leak
+# Target = shr_flux (camulator_ud/climate/bulk_flux.py) turbulent SST-derivative,
+# built per grid cell from that cell's own prescribed BL atmosphere (~ -30..-45
+# W/m2/K over ocean).  Derivative = centered +-0.5 K finite difference through the
+# net, BN in eval (deploy regime).  NO CREDIT ML: flux engine is the user's UNet,
+# the target is deterministic CESM bulk physics.
+#
+# pz220f0b is n_in=6 ocean-only (--with_atm = winds are TARGETS, not inputs), so
+# the BL atm state that the bulk-physics target needs is supplied OFFLINE via
+# --sens_atm_offline (uses the cached BL state ONLY to build the sens target; the
+# net still sees only its 6 ocean inputs -- architecture unchanged, stays n_in=6).
+# This mirrors the working 13-out kvjcofin sensreg (submit_mem24h_atm_aux_sensreg),
+# just on the gx1v7 384x320 cache so it matches v15 / POP2 exactly.
+#
+# Warm-start: pz220f0b best_model.pt (ep80 val 0.168) -> full 6->13 load (shapes
+# match).  Fresh optimizer at the reduced fine-tune LR (1e-4) so the sensitivity
+# is bent in without wrecking the fit.  A FRESH out_dir also recomputes the
+# corrected dsst_dt normalizer (kills the degenerate +700 W/m2/K instant defect).
+# Isolated out_dir: output/output_unet_gx1v7_atm_aux_sensreg (touches nothing else,
+# the coupled runs keep using the frozen ep38 best_model_snap.pt).
+#
+# GATE (not val-MSE): offline dQ/dSST audit target -10..-25 (was +7), then a
+# coupled 1-yr POP test vs the +0.484 K MSE-base drift, and a FESOM 1-yr test
+# (the run this fix is really needed for -- see memo pz220f0b-fesom-runaway).
+# Safe to resubmit: --resume continues from checkpoint.pt once one exists.
+# Submit: qsub scripts/submit_gx1v7_atm_aux_sensreg.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+INIT_CKPT=${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux/best_model.pt   # pz220f0b, ep80
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+# Fail fast if the GPU is unusable (casper "CUDA unknown error" -> silent CPU).
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable on this node'; print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux_sensreg \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --sens_atm_offline \
+    --sst_sens_reg \
+    --sens_lambda     0.2 \
+    --sens_lambda_rad 0.1 \
+    --sens_delta      0.5 \
+    --init_weights  ${INIT_CKPT} \
+    --lr            1e-4 \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      30 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    gx1v7-atm-aux-sensreg \
+    --wandb_project couple-unet
+
+echo "pz220f0b sensreg fine-tune done at $(date)"

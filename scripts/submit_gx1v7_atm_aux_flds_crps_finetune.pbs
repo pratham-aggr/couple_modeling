@@ -1,0 +1,130 @@
+#!/bin/bash
+#PBS -N gx1_flds_crps_ft
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=06:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atm_aux_flds_crps_finetune.log
+#PBS -j oe
+
+# =============================================================================
+# TARGETED FLDS SHARPENING FINE-TUNE (U-Cast Stage-2 CRPS recipe, applied to
+# ONE channel of an already-trained checkpoint).
+# =============================================================================
+# User (2026-09-04): "can we do some sort of @papers/ucast.pdf technique to
+# sharpen flds only?"
+#
+# WHY: the perfectflux experiment (--credit_fsds --credit_flds prescribing
+# REAL downwelling radiation) showed the tropical-Pacific SST cold bias all
+# but disappears (-2.03 K -> -0.04 K vs piControl) when FLDS/FSDS come from
+# truth instead of the emulator. Offline, pz220f0b's own FLDS_J is already
+# excellent by pooled R^2 (0.984) -- this is NOT a variance/skill problem,
+# it's a small, spatially-correlated ~-2 W/m2 tropical BIAS that a per-cell
+# MSE/MAE loss barely penalizes relative to total seasonal/spatial variance.
+# A prior audit (output_unet_gx1v7_atm_aux/qnet_bias_audit.json) found that
+# deficit correlates with truth cloud fraction (r=-0.32) and humidity
+# (r=-0.21) -- exactly the kind of nonlinear, tail-sensitive signal that
+# U-Cast's "blurry forecast" framing (Sec 1, citing Brenowitz et al. 2025)
+# describes: MAE/MSE training regresses toward the conditional mean and can
+# under-resolve skewed/threshold-driven targets like convective FLDS bursts.
+#
+# WHAT THIS RUN DOES: warm-starts from the existing pz220f0b checkpoint
+# (output_unet_gx1v7_atm_aux/best_model_snap.pt, --init_weights, fresh
+# optimizer) and runs U-Cast's Stage-2 CRPS fine-tune (masked_crps, already
+# implemented in train_unet.py per U-Cast Eq. 3-5, MC Dropout M=2 members,
+# dropout=0.1 -- the SAME rate the base checkpoint was already trained with)
+# for a short 8-epoch budget (paper: Stage-2 is ~15% of total training cost
+# once Stage-1 dynamics are already learned -- exactly our situation, since
+# we start from an already-converged checkpoint instead of from scratch).
+#
+# SCOPED TO FLDS ONLY via --loss_weights: FLDS_J gets weight 1.0, every other
+# one of the 13 output channels (TAUX/TAUY/SHFLX/LHFLX/QFLX/FSDS_J/PRECT/
+# Ubot/Vbot/Tbot/Qbot/PS) gets a small 0.05 anchor weight -- enough to keep
+# the shared UNet trunk from drifting on the already-good channels (esp.
+# TAUX/TAUY, already the weakest at R^2~0.7, must not be put at risk), while
+# almost all the CRPS gradient signal goes to FLDS. This is the same
+# "targeted fine-tune from a known-good checkpoint" pattern already used for
+# the sensreg dQ/dSST fix in this project -- training-time, not a serving-
+# side flux correction.
+#
+# Output: output/output_unet_gx1v7_atm_aux_flds_crps (NEW dir -- the original
+# pz220f0b checkpoint at output_unet_gx1v7_atm_aux is never touched/overwritten).
+# Same cache/data/split as the original training run (couple_cache_gx1v7_
+# mem24h, temporal split, test years 2013-2014) so R^2/CRPS/SSR are directly
+# comparable to the base checkpoint's own metrics_test.json.
+#
+# Submit: qsub scripts/submit_gx1v7_atm_aux_flds_crps_finetune.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+for f in "${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux/best_model_snap.pt" \
+         "${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux/model_config.json" \
+         "/glade/work/praggarwal/couple_cache_gx1v7_mem24h/normalizer.npz"; do
+  [ -e "$f" ] || { echo "ERROR: missing $f"; exit 1; }
+done
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux_flds_crps \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --with_rad \
+    --with_precip \
+    --dropout       0.1 \
+    --loss          crps \
+    --crps_members  2 \
+    --loss_weights  0.05 0.05 0.05 0.05 0.05 0.05 1.0 0.05 0.05 0.05 0.05 0.05 0.05 \
+    --init_weights  ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux/best_model_snap.pt \
+    --lr            7e-5 \
+    --optimizer     adamw \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    8 \
+    --patience      0 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    gx1v7-atm-aux-flds-crps-finetune \
+    --wandb_project couple-unet
+
+echo "FLDS CRPS fine-tune training done at $(date)"
+
+# --- separate follow-up pass: eval_test loads out_dir/best_model.pt (just
+#     written above) and reports R2/RMSE + CRPS/SSR on the held-out test set,
+#     directly comparable to the base checkpoint's own metrics_test.json ---
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux_flds_crps \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --with_rad \
+    --with_precip \
+    --dropout       0.1 \
+    --loss          crps \
+    --crps_members  2 \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --batch         8 \
+    --base          64 \
+    --eval_test \
+    --eval_prob \
+    --eval_members  8
+
+echo "FLDS CRPS fine-tune eval done at $(date)"

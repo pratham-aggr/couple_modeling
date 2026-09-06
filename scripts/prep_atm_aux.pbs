@@ -22,14 +22,14 @@ cd ${COUPLE_DIR}
 # 1. Build Y_atm.npy (Ubot,Vbot,Tbot,Qbot,PS at t-1) if not already present.
 if [ ! -f "${CACHE}/Y_atm.npy" ]; then
     echo "Building Y_atm.npy ..."
-    python -u add_atm_to_cache.py --cache_dir ${CACHE} --zarr_glob "${ZARR_GLOB}"
+    python -u preprocessing/add_atm_to_cache.py --cache_dir ${CACHE} --zarr_glob "${ZARR_GLOB}"
 else
     echo "Y_atm.npy already exists — skipping cache build."
 fi
 
 # 2. Precompute the 13-channel normaliser for the EXPERIMENT run.
 echo "Precomputing 13-channel normaliser (flux+rad+precip+atm) ..."
-python -u precompute_norm.py \
+python -u preprocessing/precompute_norm.py \
     --cache_dir      ${CACHE} \
     --out_dir        ${COUPLE_DIR}/output/output_unet_mem24h_atm_aux \
     --zarr_glob      "${ZARR_GLOB}" \
@@ -39,7 +39,7 @@ python -u precompute_norm.py \
 
 # 3. Precompute the 8-channel normaliser for the matched BASELINE run.
 echo "Precomputing 8-channel normaliser (flux+rad+precip) ..."
-python -u precompute_norm.py \
+python -u preprocessing/precompute_norm.py \
     --cache_dir      ${CACHE} \
     --out_dir        ${COUPLE_DIR}/output/output_unet_mem24h_mse_baseline \
     --zarr_glob      "${ZARR_GLOB}" \

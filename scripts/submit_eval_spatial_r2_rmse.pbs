@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -N eval_test_maps
+#PBS -A UCSD0044
+#PBS -q casper
+#PBS -l select=1:ncpus=16:mem=160GB
+#PBS -l walltime=02:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/eval_test_maps.log
+#PBS -j oe
+
+# =============================================================================
+# Test-period truth/predicted/error spatial maps (appendix) for the DEPLOYED
+# pz220f0b sensreg checkpoint (output_unet_gx1v7_atm_aux_sensreg), full 2912-
+# sample held-out test set. Read-only offline eval -- no training, no coupled
+# run scripts touched. See eval_spatial_r2_rmse.py docstring for details.
+#
+# CPU-only (htc queue) -- the nvgpu queue had a ~6h backlog for a job this
+# small (single UNet forward pass over 2912 samples); CPU is plenty for a
+# one-off offline eval and htc schedules far faster.
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -uo pipefail
+echo "PBS start $(date) node=$(hostname) jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -u eval_spatial_r2_rmse.py --bs 32
+RC=$?
+echo "eval done $(date) rc=$RC"

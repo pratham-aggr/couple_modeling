@@ -35,8 +35,8 @@ python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', tor
 python -u train_unet.py \
     --zarr_glob     "${ZARR_GLOB}" \
     --out_dir       ${COUPLE_DIR}/output/output_unet_mem24h_atm_aux_sensreg \
-    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
-    --grid_shape    320 384 \
+    --cache_dir     /glade/work/praggarwal/couple_cache_mem24h \
+    --grid_shape    192 288 \
     --subsample     1.0 \
     --memory \
     --dsst_dt \

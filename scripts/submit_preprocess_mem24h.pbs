@@ -18,10 +18,10 @@ cd /glade/u/home/praggarwal/couple
 find . -path ./__pycache__ -prune -o -name "*.pyc" -print -exec rm {} \;
 
 echo "=== Preprocessing memory cache ==="
-python -u preprocess_data.py --memory
+python -u preprocessing/preprocess_data.py --memory
 
 echo "=== Adding CO2 to memory cache ==="
-python -u add_co2_to_cache.py \
+python -u preprocessing/add_co2_to_cache.py \
     --cache_dir /glade/work/praggarwal/couple_cache_mem24h
 
 echo "Done: $(date)"

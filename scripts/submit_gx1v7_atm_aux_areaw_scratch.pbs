@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N gx1_auxareaw
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atm_aux_areaw_scratch.log
+#PBS -j oe
+
+# =============================================================================
+# FROM-SCRATCH gx1v7-NATIVE flux+wind net, SPATIALLY WEIGHTED (U-Cast Eq. 2).
+# =============================================================================
+# User (2026-09-05): "begin a new deterministic training where you spatially
+# weight like @papers/ucast.pdf deterministic training (though they use mae,
+# make sure to use mse instead) everything should be exactly the same as
+# pz220f0b."
+#
+# BYTE-IDENTICAL to submit_gx1v7_atm_aux_scratch.pbs (the original pz220f0b
+# training: same zarr_glob, cache, grid_shape, memory/dsst_dt/with_atm/augment/
+# dropout/with_rad/with_precip, loss=mse, lr, scheduler, split, test_years,
+# epochs, patience, batch, base) EXCEPT ONE addition: --area_weight.
+#
+# WHY: verified from code (train_unet.py's masked_mse + the actual training
+# invocations) that neither the base pz220f0b run nor its CRPS finetune ever
+# spatially weighted the loss -- --lat_weight exists but was never passed, and
+# even if it had been, its cos(lat) formula is built from linspace(-90,90,H)
+# for a REGULAR 192-pt CAM grid, which is wrong for gx1v7's native curvilinear
+# 384x320 tripole grid this model actually trains on. U-Cast Sec 3.1 Eq. 2
+# defines the deterministic pretraining loss as
+#     L_det = (1/HW) sum_{h,w} a_h * |pred-target|_1,
+# with a_h = latitude-dependent AREA weights (their Sec 3.1, citing Rasp et
+# al. 2024) -- for our curvilinear grid the direct generalisation of "area
+# weight" is the actual per-cell TAREA (added as train_unet.py's new
+# --area_weight flag), not a cos(lat) proxy that assumes iso-latitude rows.
+# Per the user's instruction we use MSE (not MAE) with this same weighting.
+#
+# Output: output/output_unet_gx1v7_atm_aux_areaw  (does NOT touch or overwrite
+# the base output_unet_gx1v7_atm_aux checkpoint used by the live 50-yr run,
+# the credit_wind chain, or the CRPS finetune).
+# Submit: qsub scripts/submit_gx1v7_atm_aux_areaw_scratch.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux_areaw \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --area_weight \
+    --loss          mse \
+    --lr            3e-4 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    gx1v7-atm-aux-areaw-scratch \
+    --wandb_project couple-unet
+
+echo "gx1v7 from-scratch flux+wind (atm-aux, area-weighted) training done at $(date)"

@@ -1,0 +1,70 @@
+#!/bin/bash
+#PBS -N unified_fw_o2
+#PBS -A UCSD0085
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=32:ngpus=2:mem=200GB:gpu_type=a100
+#PBS -l walltime=12:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/unified_flux_wind_option2.log
+#PBS -j oe
+
+# =============================================================================
+# UNIFIED flux+wind model -- OPTION 2 (the PROPER build): 2 emulators total.
+#
+# The first unified run (output_unified_flux_wind, wandb 4xmj60a2) predicted
+# ABSOLUTE winds with plain rollout MSE and was never coupled-validated -- offline
+# it is the "full-wind" flavor (blur->weak winds or OOD->blowup) with no dQ/dSST
+# feedback shaping.  This run adds the three pieces that already work in the two
+# SEPARATE nets, fused into ONE net so we run flux+wind in a single emulator:
+#
+#   --residual        wind outputs are ANOMALIES on a fixed monthly climatology,
+#                     fed back as clim[month]+anomaly (mirrors the WORKING residual
+#                     emulator, job 7054940: bounded @ +0.58 floor, self-generated
+#                     ENSO, no blowup).  Worst case (anomaly->0) = the exact floor.
+#   --sst_sens_reg    bulk-flux SST-sensitivity penalty on the FLUX outputs (dQ/dSST
+#                     toward physical ~-30; radiation toward 0) -- mirrors the
+#                     deployed v15 sensreg fine-tune that gave +0.002 K with true winds.
+#   --init_from       partial warm-start from the validated v15 flux net so the fused
+#                     net inherits the +0.002 K flux quality/feedback instead of
+#                     re-deriving it (backbone + first 8 flux-head channels; the 5
+#                     wind-head channels start fresh).
+#
+# Isolated out_dir: output/output_unified_flux_wind_o2 (touches nothing else).
+# GATE (offline): stability probe |wind|@120 ~ 7 m/s (not collapsed/blown up) AND
+#   dQ/dSST audit of the flux head restoring (~-20..-30).  THEN a coupled 1-yr test
+#   (needs additive server wiring for the 13-out unified path) vs the +0.58 floor.
+# Submit:  qsub scripts/submit_unified_flux_wind_option2.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+
+python -c "import torch; n=torch.cuda.device_count(); assert n>=2, f'need 2 GPUs, got {n}'; print('GPUs:', [torch.cuda.get_device_name(i) for i in range(n)])"
+
+python -u train_unified_flux_wind_rollout.py \
+    --out_dir     output/output_unified_flux_wind_o2 \
+    --train_years 1980-2010 \
+    --val_years   2011-2012 \
+    --test_years  2013-2014 \
+    --residual \
+    --sst_sens_reg --sens_lambda 0.2 --sens_lambda_rad 0.1 --sens_delta 0.5 \
+    --init_from   output/output_unet_gx1v7_sensreg/best_model.pt \
+    --rollout        8 \
+    --rollout_start  2 \
+    --rollout_ramp_epochs 8 \
+    --stride      2 \
+    --epochs      40 \
+    --batch       12 \
+    --base        64 \
+    --lr          1e-4 \
+    --dropout     0.1 \
+    --ema \
+    --probe_steps 120 \
+    --var_loss_weight 0.0 \
+    --wandb_name    mem24h-unified-flux-wind-o2 \
+    --wandb_project couple-unet
+
+echo "unified flux+wind OPTION 2 training done $(date)"

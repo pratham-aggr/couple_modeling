@@ -1,0 +1,114 @@
+==============================================================================
+FASST THROUGHPUT BENCHMARK -- SUMMARY
+generated: 2026-08-27T12:31:45-06:00
+==============================================================================
+
+Model: FASST = pz220f0b UNFINETUNED flux U-Net + ML sea-ice emulator + POP2
+       gx1v7 384x320 native grid | 6-hourly atmosphere exchange | monthly ice
+       checkpoint: output_unet_gx1v7_atm_aux/best_model_snap.pt
+Scientific configuration is IDENTICAL to the production run in every respect;
+only the hardware layout differs between the two benchmarks below.
+SYPD = simulated_years / (wall_clock_seconds / 86400). Initialization excluded
+and reported separately. Queue time excluded.
+
+------------------------------------------------------------------------------
+ATMOSPHERE ONLY
+------------------------------------------------------------------------------
+  hardware : 1 dedicated A100 (no ocean model, no MPI)
+  GPU      : NVIDIA A100-SXM4-40GB, 40960 MiB
+  ckpt     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+
+  run  jobid                  SYPD    wall s   init s   rc
+  1    7255997.desched1     160.20      1618        8    0
+  2    7256086.desched1     161.40      1606       48    0
+  3    7256185.desched1     161.00      1610       12    0
+
+  successful runs : 3
+  mean SYPD       : 160.87 +/- 0.61 (sd, n=3)
+  mean wall clock : 1611 s for 3 simulated years
+  mean init/setup : 23 s (EXCLUDED from SYPD)
+  ms/step (wall)  : 367.9  (includes 0.1 s server go.flag poll)
+
+  per-stage atmosphere-step breakdown (server instrumentation, mean ms):
+    prep (input assembly)                8.5 ms
+    infer (pure NN)                     10.3 ms
+    post (units/albedo/clip/ice)        85.7 ms
+    write (cam_out.nc)                  63.2 ms
+    END-TO-END STEP                    167.7 ms
+    implied SYPD (compute only, no handshake): 353.0
+
+------------------------------------------------------------------------------
+FULL COUPLED  [2 CPU nodes + 1 A100, 1-yr segments -- CAMulator-comparable layout]
+------------------------------------------------------------------------------
+  hardware : 2 CPU nodes (256 POP ranks, 128/node) + 1 dedicated A100 (server)
+  GPU      : NVIDIA A100-SXM4-40GB
+  ckpt     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+
+  run  jobid                  SYPD    wall s   init s   rc
+  1    7259627.desched1      34.99      2469       80    0
+
+  successful runs : 1
+  mean SYPD       : 34.99  (single run, no sd)
+  mean wall clock : 2469 s for 1 simulated years
+  mean init/setup : 80 s (EXCLUDED from SYPD)
+  min per sim-year: 41.15
+
+------------------------------------------------------------------------------
+FULL COUPLED  [2 CPU nodes + 1 A100, 3-yr segments -- CAMulator-comparable layout]
+------------------------------------------------------------------------------
+  (no runs recorded yet)
+
+------------------------------------------------------------------------------
+FULL COUPLED  [4 GPU nodes -- PRODUCTION hardware shape]
+------------------------------------------------------------------------------
+  hardware : 4 GPU nodes, 256 POP ranks (64/node), server on mother-node A100 (PRODUCTION SHAPE)
+  GPU      : NVIDIA A100-SXM4-40GB
+  ckpt     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+
+  run  jobid                  SYPD    wall s   init s   rc
+  1    7256129.desched1      37.42      6928       48    0
+  2    7257568.desched1      37.42      6926       50    0
+  3    7257569.desched1      37.52      6909       10    0
+
+  successful runs : 3
+  mean SYPD       : 37.45 +/- 0.06 (sd, n=3)
+  mean wall clock : 6921 s for 3 simulated years
+  mean init/setup : 36 s (EXCLUDED from SYPD)
+  min per sim-year: 38.45
+
+------------------------------------------------------------------------------
+COMPARISON  (NOT apples-to-apples -- hardware and methodology differ)
+------------------------------------------------------------------------------
+  FASST atmosphere-only        : see above, 1 A100, no ocean in the loop
+  FASST coupled, 2CPU+1A100    : see above -- the layout matching CAMulator's row
+                                 THIS is the number to quote against CAMulator.
+  FASST coupled, 4 GPU nodes   : see above -- PRODUCTION hardware shape; NOT
+                                 comparable to the CAMulator 2CPU+1A100 row
+  CAMulator atmosphere step    : ~220 ms/step on an A100 (published reference:
+                                 input build 5 + inference 190 + inverse transform 8
+                                 + T62<->1deg remap 3 + write 15 ms)
+  CAMulator + POP2 + CICE      : 42.025 SYPD on 2 CPU + 1 A100 (published)
+  GIAF (DATM + POP2 + CICE)    : 37.935 SYPD on 2 CPU nodes (published)
+  Full CESM2 (CAM6 + POP2)     : ~7.3 SYPD on 8 CPU nodes (published)
+
+  Caveats:
+   - FASST runs natively on gx1v7, so its flux path has NO grid remap step,
+     unlike CAMulator's T62<->1deg transform.
+   - FASST's atmosphere step includes the monthly ML sea-ice emulator and the
+     ice-ocean flux weighting (inside 'post'); CAMulator's 220 ms does not.
+   - The published CAMulator/GIAF/CESM2 numbers were measured by others on
+     their own configurations; they are context, not a controlled comparison.
+   - The 1-year 2CPU+1A100 segments include POP's own initialization (~39 s,
+     1.6% of wall) inside the timed window, amortized over a single simulated
+     year; this makes their SYPD slightly CONSERVATIVE.
+   - The 2CPU+1A100 layout packs 128 POP ranks per node; the 4-GPU-node layout
+     spreads the same 256 ranks over 4 nodes at 64/node, so it sees less
+     per-node memory-bandwidth contention and runs ~5% faster per coupling
+     step. Same core count and same single A100 in both cases.
+
+Reproduce:
+  BENCH_RUN=N qsub -q main@desched1 -v BENCH_RUN \
+      camulator_ud/climate/bench_fasst_coupled_3yr.pbs
+  BENCH_RUN=N qsub -q main@desched1 -v BENCH_RUN \
+      camulator_ud/climate/bench_fasst_atm_3yr.pbs
+==============================================================================

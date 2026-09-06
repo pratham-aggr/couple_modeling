@@ -16,12 +16,12 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 
 cd /glade/u/home/praggarwal/couple
 
-python -u preprocess_data.py \
+python -u preprocessing/preprocess_data.py \
     --lag       24 \
     --sixhour \
     --cache_dir /glade/work/praggarwal/couple_cache_lag24h
 
-python -u add_co2_to_cache.py \
+python -u preprocessing/add_co2_to_cache.py \
     --cache_dir /glade/work/praggarwal/couple_cache_lag24h
 
 echo "Done: $(date)"

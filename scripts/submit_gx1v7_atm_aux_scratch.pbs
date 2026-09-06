@@ -1,0 +1,62 @@
+#!/bin/bash
+#PBS -N gx1_auxscratch
+#PBS -A UCSD0044
+#PBS -q nvgpu
+#PBS -l select=1:ncpus=16:ngpus=1:mem=350GB:gpu_type=a100
+#PBS -l walltime=24:00:00
+#PBS -o /glade/u/home/praggarwal/couple/output/logs/gx1v7_atm_aux_scratch.log
+#PBS -j oe
+
+# =============================================================================
+# FROM-SCRATCH gx1v7-NATIVE flux+wind net (user 2026-08-11): "start a new from
+# scratch 384x320 training like kvjcofin".  Same architecture as kvjcofin
+# (n_in=6 ocean-only -> n_out=13 = 8 flux + 5 BL winds, NON-autoregressive: winds
+# are diagnosed from the ocean state, no feedback), but trained NATIVELY on the
+# gx1v7 384x320 cache (couple_cache_gx1v7_mem24h) so it matches v15 / POP2 exactly
+# -- no CAM->gx1v7 grid mismatch (the original kvjcofin was 192x288 CAM grid).
+#
+# Cache: gx1v7 mem24h.  X (6 ocean), Y (5 flux) + Y_rad (2) + Y_precip (1) = 8
+# flux targets; Y_atm (5 wind targets) is symlinked to X_atm (the winds at time t)
+# so the net learns winds(t)=f(ocean(t)) -- a diagnostic, contemporaneous target.
+# Fresh (NO --init_weights), plain MSE (like kvjcofin base); a sensreg flux-feedback
+# fine-tune can warm-start from THIS output afterwards.
+# Output: output/output_unet_gx1v7_atm_aux
+# Submit: qsub scripts/submit_gx1v7_atm_aux_scratch.pbs
+# =============================================================================
+COUPLE_DIR=/glade/u/home/praggarwal/couple
+ZARR_GLOB="/glade/derecho/scratch/praggarwal/zarr_gx1v7/b.e21.CREDIT_gx1v7_????.zarr"
+
+set -euo pipefail
+echo "PBS start $(date)  node=$(hostname)  jobid=$PBS_JOBID"
+module load conda
+conda activate /glade/work/praggarwal/conda-envs/atm
+cd ${COUPLE_DIR}
+python -c "import torch; assert torch.cuda.is_available(); print('CUDA OK:', torch.cuda.get_device_name(0))"
+
+python -u train_unet.py \
+    --zarr_glob     "${ZARR_GLOB}" \
+    --out_dir       ${COUPLE_DIR}/output/output_unet_gx1v7_atm_aux \
+    --cache_dir     /glade/work/praggarwal/couple_cache_gx1v7_mem24h \
+    --grid_shape    320 384 \
+    --subsample     1.0 \
+    --memory \
+    --dsst_dt \
+    --with_atm \
+    --augment \
+    --dropout       0.1 \
+    --with_rad \
+    --with_precip \
+    --loss          mse \
+    --lr            3e-4 \
+    --scheduler     cosine \
+    --split_mode    temporal \
+    --test_years    2013 2014 \
+    --max_epochs    80 \
+    --patience      20 \
+    --batch         8 \
+    --base          64 \
+    --resume \
+    --wandb_name    gx1v7-atm-aux-scratch \
+    --wandb_project couple-unet
+
+echo "gx1v7 from-scratch flux+wind (atm-aux) training done at $(date)"

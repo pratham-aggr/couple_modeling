@@ -1,0 +1,60 @@
+FASST ATMOSPHERE-ONLY THROUGHPUT BENCHMARK -- run 4
+timestamp        : 2026-08-29T18:59:26-06:00
+pbs jobid        : 7289725.desched1
+stub exit code   : 0
+
+-- hardware --
+  layout         : 1 dedicated A100 (no ocean model, no MPI)
+  node           : deg0064 
+  GPU            : NVIDIA A100-SXM4-40GB, 40960 MiB
+  PBS select     : 1:ncpus=64:mpiprocs=1:ngpus=1:mem=200GB
+  production job : 7255561 on   (node-disjoint, verified)
+
+-- configuration (identical to production pz220f0b) --
+  memo config    : /glade/u/home/praggarwal/couple/camulator_ud/climate/memo_config_gx1v7_diagfw.yml
+  checkpoint     : best_model_snap.pt  md5=41618697c617c9a26434d4a2ef470f92
+  grid           : gx1v7 384x320 (native, NO grid remap in the flux path)
+  cadence        : 6-hourly; 8 delivered flux fields (+5 diagnosed winds)
+  ice            : monthly ML sea-ice emulator ACTIVE (production flags verbatim);
+                   its cost falls inside the 'post' stage below
+  serving flags  : --diag_flux_wind --tau_sign_fix --dsst_cap 0 --tau_cap 0
+                   --flux_ramp_days 0 --ocn_albedo --ice_couple --ice_virtual
+                   --ice_input_from_emu --ice_ramp_days 20
+  driver         : bench_atm_stub_pop.py (mimics POP's handshake; SST held at
+                   a real production snapshot -- CNN cost is value-independent)
+  I/O included   : per-step memo_sst_in.nc read + memo_cam_out.nc write
+                   (the 'write' stage). NO POP history/restart I/O.
+  git commit     : 158ee0e15518bab6565683ef435e03a534c3e732
+
+-- timing --
+  simulated years         : 3
+  6-hourly steps          : 4380
+  wall clock (driving)    : 1400.1 s
+  init/setup (excluded)   : 26.1 s
+  SYPD (wall)             : 185.1
+  ms/step (wall)          : 319.7
+  SYPD formula            : 3 / (1400.1/86400)
+  NOTE: wall-clock ms/step includes the server's 0.1 s go.flag poll
+        (a coupling-handshake artifact, ~50 ms/step on average, NOT
+        atmosphere compute). The stage breakdown below excludes it.
+
+-- per-stage breakdown (server's own instrumentation) --
+  parsed 4380 instrumented steps from /glade/derecho/scratch/praggarwal/fasst_bench_atm_run4/run/memo_server.log  (analysing 4360 after dropping 20 warm-up)
+  
+  stage        mean ms    median       p5      p95  % of step
+  prep             8.1       8.0      8.0      8.0       6.3%
+  infer           10.0      10.0     10.0     10.0       7.7%
+  post            96.1      96.0     91.0    103.1      74.2%
+  write           15.3      15.0     15.0     16.0      11.8%
+  -----------------------------------------------------------
+  STEP SUM       129.6     129.0    124.0    138.0     100.0%
+  logged tot     129.6     130.0    120.0    140.0
+  
+    pure NN inference        : 10.0 ms/step
+    end-to-end atmosphere step: 129.6 ms/step (prep+infer+post+write; CAMulator reference ~220 ms)
+    implied atmosphere-only SYPD (compute only, no handshake): 456.8
+  
+  wrote /glade/u/home/praggarwal/couple/benchmark_results/fasst_speed/raw/atmosphere_run4_stages.json
+
+-- reproduce --
+  BENCH_RUN=4 qsub -q main@desched1 -v BENCH_RUN /glade/u/home/praggarwal/couple/camulator_ud/climate/bench_fasst_atm_3yr.pbs

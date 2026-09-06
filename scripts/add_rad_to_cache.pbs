@@ -20,7 +20,7 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 cd ${COUPLE_DIR}
 
 echo "Appending FSDS_J / FLDS_J (J/m2) to mem24h cache as Y_rad.npy ..."
-python -u add_rad_to_cache.py \
+python -u preprocessing/add_rad_to_cache.py \
     --cache_dir /glade/work/praggarwal/couple_cache_mem24h \
     --zarr_glob "${ZARR_GLOB}"
 

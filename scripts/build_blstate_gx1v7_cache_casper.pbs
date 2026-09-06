@@ -18,7 +18,7 @@ echo "started $(date) on $(hostname)"
 ATM_PY=/glade/work/praggarwal/conda-envs/atm/bin/python
 cd /glade/u/home/praggarwal/couple
 
-"$ATM_PY" -u add_blstate_to_gx1v7_cache.py --workers 8
+"$ATM_PY" -u preprocessing/add_blstate_to_gx1v7_cache.py --workers 8
 
 # Post-build sanity: only if THIS job took the lock (otherwise the other job may
 # still be mid-write and sampling the memmap would false-fail).

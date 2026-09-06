@@ -19,7 +19,7 @@ echo "started $(date) on $(hostname)"
 ATM_PY=/glade/work/praggarwal/conda-envs/atm/bin/python
 cd /glade/u/home/praggarwal/couple
 
-"$ATM_PY" -u add_blstate_to_gx1v7_cache.py --workers 8
+"$ATM_PY" -u preprocessing/add_blstate_to_gx1v7_cache.py --workers 8
 
 # Post-build sanity: shape, finiteness, physically plausible channel stats.
 "$ATM_PY" - <<'EOF'

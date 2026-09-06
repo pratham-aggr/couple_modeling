@@ -1197,12 +1197,32 @@ def main():
                         help="Number of MC Dropout ensemble members for CRPS loss (default 2).")
     parser.add_argument("--lat_weight", action="store_true",
                         help="Weight loss by cos(lat): de-emphasises polar regions. "
-                             "Precomputed as (1,1,H,1) tensor before the training loop.")
-    parser.add_argument("--loss_weights", type=float, nargs=5,
+                             "Precomputed as (1,1,H,1) tensor before the training loop. "
+                             "Assumes a REGULAR CAM lat-lon grid (linspace(-90,90,H)) -- "
+                             "not valid for --grid_shape 320 384 (gx1v7 native curvilinear "
+                             "tripole); use --area_weight for that grid instead.")
+    parser.add_argument("--area_weight", action="store_true",
+                        help="U-Cast Eq.2-style spatially weighted loss (Sec 3.1: "
+                             "L_det = (1/HW) sum a_h * error, a_h = latitude-dependent AREA "
+                             "weights) generalised to gx1v7's curvilinear tripole grid: uses "
+                             "the ACTUAL per-cell area (TAREA from --gx1v7_domain) as a_{h,w} "
+                             "instead of a cos(lat) proxy, since gx1v7 cells aren't iso-"
+                             "latitude rows. masked_mse's (err*mask).sum()/mask.sum() form "
+                             "self-normalises, so raw TAREA (no renormalization) is correct. "
+                             "Mutually exclusive with --lat_weight.")
+    parser.add_argument("--gx1v7_domain", type=str,
+                        default="/glade/campaign/cesm/cesmdata/inputdata/share/domains/"
+                                "domain.ocn.gx1v7.210716.nc",
+                        help="Domain file to read TAREA from for --area_weight.")
+    parser.add_argument("--loss_weights", type=float, nargs="+",
                         default=[1.0, 1.0, 1.0, 1.0, 1.0],
-                        metavar=("W_TAUX", "W_TAUY", "W_SHFLX", "W_LHFLX", "W_QFLX"),
-                        help="Per-variable loss multipliers in TAUX TAUY SHFLX LHFLX QFLX "
-                             "order (default: 1 1 1 1 1). Logged as val/wloss_{var}.")
+                        metavar="W",
+                        help="Per-variable loss multipliers, in the SAME order as the "
+                             "model's output_vars (e.g. for pz220f0b's 13-channel head: "
+                             "TAUX TAUY SHFLX LHFLX QFLX FSDS_J FLDS_J PRECT Ubot Vbot Tbot "
+                             "Qbot PS). Pass one weight per output channel; fewer than "
+                             "n_out truncates (legacy 5-channel configs), more is an error. "
+                             "Default: all 1.0 (identity). Logged as val/wloss_{var}.")
     parser.add_argument("--dsst_dt", action="store_true",
                         help="Append (SST[t]-SST[t-lag])/86400 as an extra input channel. "
                              "Only meaningful with --memory. Stats computed from chosen samples.")
@@ -1410,6 +1430,7 @@ def main():
             f"{'-cosine' if args.scheduler == 'cosine' else ''}"
             f"{'-muon' if args.optimizer == 'muon' else ''}"
             f"{'-latw' if args.lat_weight else ''}"
+            f"{'-areaw' if args.area_weight else ''}"
             f"{'-vw' if any(w != 1.0 for w in args.loss_weights) else ''}"
             f"{'-dsst' if args.dsst_dt else ''}"
             f"{'-tvalsplit' if args.val_split_mode == 'temporal' else ''}"
@@ -1838,15 +1859,37 @@ def main():
             wandb.finish()
         return
 
-    # Precompute latitude weights (1, 1, H, 1) — cos(lat) over 192-pt regular grid
+    # Precompute spatial weights for the U-Cast Eq.2-style weighted loss.
+    if args.lat_weight and args.area_weight:
+        raise SystemExit("--lat_weight and --area_weight are mutually exclusive")
     if args.lat_weight:
+        # cos(lat) over a REGULAR 192-pt CAM grid: (1, 1, H, 1)
         lats_rad = np.deg2rad(np.linspace(-90.0, 90.0, H))
         lat_w = torch.from_numpy(np.cos(lats_rad).astype(np.float32)).to(device).view(1, 1, H, 1)
         print(f"Latitude weighting: cos(lat) in [{lat_w.min():.3f}, {lat_w.max():.3f}]")
+    elif args.area_weight:
+        # gx1v7 native curvilinear tripole grid: a_h generalises to the actual
+        # per-cell area a_{h,w} (TAREA), since rows aren't iso-latitude here.
+        # Use the REAL sample shape (mask_np), not the H,W globals -- those are
+        # swapped for gx1v7 (--grid_shape is passed "320 384" but the actual
+        # per-sample arrays are (384, 320); see _log_rmse_maps's comment above).
+        Hd, Wd = mask_np.shape[1], mask_np.shape[2]
+        with xr.open_dataset(args.gx1v7_domain) as _dsd:
+            area = np.nan_to_num(_dsd["area"].values.astype(np.float32), nan=0.0)
+        assert area.shape == (Hd, Wd), \
+            f"--gx1v7_domain area shape {area.shape} != training sample shape {(Hd, Wd)}"
+        lat_w = torch.from_numpy(area).to(device).view(1, 1, Hd, Wd)
+        print(f"Area weighting (gx1v7 TAREA): [{lat_w.min():.3e}, {lat_w.max():.3e}], "
+              f"shape {tuple(lat_w.shape)}")
     else:
         lat_w = None
 
     # Per-variable loss weights — None when all ones (identity, existing behavior)
+    if 0 < len(args.loss_weights) < n_out:
+        raise SystemExit(f"--loss_weights got {len(args.loss_weights)} values but the model "
+                          f"has n_out={n_out} output channels ({tgt_vars}); pass exactly "
+                          f"n_out weights (one per output_vars entry) to avoid silently "
+                          f"truncating/misaligning the weight vector.")
     _lw   = args.loss_weights[:n_out]
     var_w = (torch.tensor(_lw, dtype=torch.float32, device=device)
              if any(w != 1.0 for w in _lw) else None)

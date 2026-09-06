@@ -20,7 +20,7 @@ conda activate /glade/work/praggarwal/conda-envs/atm
 cd ${COUPLE_DIR}
 
 echo "Appending PRECT (m/6h) to mem24h cache as Y_precip.npy ..."
-python -u add_precip_to_cache.py \
+python -u preprocessing/add_precip_to_cache.py \
     --cache_dir /glade/work/praggarwal/couple_cache_mem24h \
     --zarr_glob "${ZARR_GLOB}"
 
