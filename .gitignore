@@ -7,10 +7,15 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# Model outputs (large binary files)
+# Model outputs (large binary files) -- all regenerable analysis/figure/checkpoint
+# output, none of it should ever be committed (this was the single biggest source
+# of repo bloat: .git had grown to 600MB+ from historical gifs/PDFs under output/).
+output/
 output_*/
 *.pt
 *.npz
+*.npy
+*.gif
 
 # Logs
 *.log
